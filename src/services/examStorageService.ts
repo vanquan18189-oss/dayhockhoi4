@@ -1,0 +1,637 @@
+import { db, isFirestoreQuotaExceeded, markFirestoreQuotaExceeded } from './firebase';
+import { collection, doc, getDoc, getDocs } from 'firebase/firestore';
+import { trackedSetDoc, trackedDeleteDoc, trackedWriteBatch, extractFirestoreErrorDetails } from './firestoreWriteTracker';
+import { ExamPaper } from '../types';
+import { removeUndefined } from './teacherStorageService';
+import { waitForWriteConfirmation, updateCollectionCacheStatus } from './firestoreWriteVerificationService';
+import { normalizeClassKey } from './studentStorageService';
+import {
+  getScopedDocs,
+  subscribeScopedCollection,
+  getFirestoreAccessScope,
+  resolveTeacherIdentityForWrite,
+  ScopeOverride
+} from './firestoreScopeService';
+
+const EXAMS_CACHE_KEY = 'eduplay_k4_cached_exams';
+
+/**
+ * Kiểm tra xem một đề thi có phải là đề kiểm tra chính thức hợp lệ hay không.
+ * Loại bỏ hoàn toàn các bản nháp rác/tài liệu sinh tự động lỗi (không có câu hỏi, không có tiêu đề, hoặc chỉ là vỏ bọc bài nộp).
+ */
+export function isValidOfficialExam(exam: Partial<ExamPaper> | null | undefined): boolean {
+  if (!exam || typeof exam !== 'object') return false;
+  if (!exam.id || typeof exam.id !== 'string') return false;
+  if ((exam as any).isDeleted) return false;
+
+  // Tiêu đề bắt buộc phải có nội dung và không được rỗng
+  const title = (exam.title || '').trim();
+  if (!title) return false;
+
+  // Bắt buộc phải có danh sách câu hỏi hợp lệ với ít nhất 1 câu hỏi
+  // (Loại bỏ triệt để các bản ghi rác/nháp phát sinh do nộp bài chỉ chứa submissions/submissionsCount)
+  if (!Array.isArray(exam.questions) || exam.questions.length === 0) {
+    return false;
+  }
+
+  // Bắt buộc phải có môn học
+  const subject = (exam.subject || '').trim();
+  if (!subject) return false;
+
+  return true;
+}
+
+/**
+ * Deduplication helper for exam papers
+ */
+export function getExamDeduplicationKey(e: Partial<ExamPaper>): string {
+  if (!e) return '';
+  const cleanTitle = (e.title || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^đề kiểm tra:\s*/i, '')
+    .replace(/\s+/g, ' ');
+  const targetClass = (e.targetClass || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '');
+  const subject = (e.subject || '').trim().toLowerCase();
+  const grade = (e.grade || '').trim().toLowerCase();
+  const originalExamId = (e.originalExamId || '').trim();
+
+  if (originalExamId && targetClass) {
+    return `root_${originalExamId}__cls_${targetClass}`;
+  }
+  return `title_${cleanTitle}__cls_${targetClass}__sub_${subject}__grd_${grade}`;
+}
+
+export function deduplicateExams(exams: ExamPaper[]): ExamPaper[] {
+  const seenIds = new Set<string>();
+  const clean: ExamPaper[] = [];
+
+  (exams || []).forEach(exam => {
+    if (!exam || !exam.id) return;
+    if (!isValidOfficialExam(exam)) return;
+    if (seenIds.has(exam.id)) return;
+
+    seenIds.add(exam.id);
+    clean.push(exam);
+  });
+
+  return clean;
+}
+
+/**
+ * Quét và dọn dẹp các bản ghi đề thi trùng lặp và bản nháp rác trong cả LocalStorage và Firestore
+ */
+export async function cleanDuplicateExams(): Promise<void> {
+  try {
+    const cached = getLocalCachedExams();
+    const cleanList = deduplicateExams(cached);
+    if (cleanList.length !== cached.length) {
+      console.log(`🧹 Đã dọn dẹp ${cached.length - cleanList.length} đề thi trùng lặp/bản nháp rác trong LocalStorage`);
+      saveExamsToLocalStorage(cleanList);
+    }
+
+    // Quét Firestore để dọn dẹp các tài liệu rác/bản nháp sinh tự động (chỉ Admin thực hiện toàn cục)
+    const scope = getFirestoreAccessScope();
+    if (db && scope.isAdmin) {
+      try {
+        const snap = await getDocs(collection(db, 'exams'));
+        if (!snap.empty) {
+          const ghostDocs: string[] = [];
+          snap.forEach(docSnap => {
+            const data = docSnap.data();
+            const examObj = { id: docSnap.id, ...data } as ExamPaper;
+            if (!isValidOfficialExam(examObj)) {
+              ghostDocs.push(docSnap.id);
+            }
+          });
+
+          if (ghostDocs.length > 0) {
+            console.log(`🧹 Phát hiện ${ghostDocs.length} bản nháp rác trong Firestore. Đang tiến hành làm sạch...`, ghostDocs);
+            const batch = trackedWriteBatch(db, { isUserInitiated: false, actionType: 'admin_batch' });
+            ghostDocs.forEach(id => {
+              batch.delete(doc(db, 'exams', id));
+            });
+            await batch.commit();
+            console.log(`✅ Đã xóa sạch ${ghostDocs.length} bản nháp rác khỏi Cloud Firestore!`);
+          }
+        }
+      } catch (fErr) {
+        console.warn('Lỗi quét dọn bản nháp rác trên Firestore:', fErr);
+      }
+    }
+  } catch (err) {
+    console.warn('Lỗi khi chạy cleanDuplicateExams:', err);
+  }
+}
+
+// Chạy dọn dẹp tự động khi khởi động
+if (typeof window !== 'undefined') {
+  try {
+    const cached = localStorage.getItem(EXAMS_CACHE_KEY);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (Array.isArray(parsed)) {
+        const clean = parsed.filter(isValidOfficialExam);
+        if (clean.length !== parsed.length) {
+          localStorage.setItem(EXAMS_CACHE_KEY, JSON.stringify(deduplicateExams(clean)));
+        }
+      }
+    }
+  } catch {}
+
+  setTimeout(() => {
+    cleanDuplicateExams().catch(console.error);
+  }, 1000);
+}
+
+/**
+ * Lấy danh sách đề thi từ LocalStorage Cache
+ */
+export function getLocalCachedExams(): ExamPaper[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const cached = localStorage.getItem(EXAMS_CACHE_KEY);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (Array.isArray(parsed)) {
+        return deduplicateExams(parsed);
+      }
+    }
+  } catch (e) {
+    console.warn('Lỗi đọc cache đề thi từ LocalStorage:', e);
+  }
+  return [];
+}
+
+/**
+ * Lưu danh sách đề thi vào LocalStorage Cache
+ */
+export function saveExamsToLocalStorage(exams: ExamPaper[]): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const clean = deduplicateExams(exams);
+    localStorage.setItem(EXAMS_CACHE_KEY, JSON.stringify(clean));
+    window.dispatchEvent(new CustomEvent('eduplay_exams_updated', {
+      detail: { exams: clean, timestamp: Date.now() }
+    }));
+  } catch (e) {
+    console.warn('Lỗi lưu cache đề thi vào LocalStorage:', e);
+  }
+}
+
+import { extractGradeDigit } from '../lib/constants';
+
+/**
+ * Lưu một Đề kiểm tra lên Firestore
+ */
+export async function saveExamToFirestore(exam: ExamPaper): Promise<void> {
+  try {
+    const targetDigit = extractGradeDigit(exam.targetClass) || extractGradeDigit(exam.grade) || '4';
+    const normalizedGrade = `Khối ${targetDigit}`;
+    exam.grade = normalizedGrade;
+
+    // Check if an existing record matches by OLD ID
+    const current = getLocalCachedExams();
+    const oldExistsIdx = current.findIndex(e => e.id === exam.id);
+
+    if (!exam.id.startsWith('ex-') || !exam.id.includes('-class-lp')) {
+      const classKey = normalizeClassKey(exam.targetClass || exam.grade || '4A');
+      exam.id = `ex-${exam.id.replace(/^ex-/, '')}-class-lp${classKey.toLowerCase()}`;
+    }
+
+    let updated: ExamPaper[];
+    if (oldExistsIdx >= 0) {
+      updated = current.map(e => (e.id === current[oldExistsIdx].id ? exam : e));
+    } else {
+      updated = [exam, ...current];
+    }
+    saveExamsToLocalStorage(updated);
+
+    if (!db) {
+      console.warn('Firestore chưa sẵn sàng, lưu cache cục bộ đề thi');
+      return;
+    }
+
+    const identity = resolveTeacherIdentityForWrite({
+      teacherId: exam.teacherId,
+      teacherEmail: exam.teacherEmail,
+      teacherName: exam.teacherName,
+      createdBy: exam.createdBy
+    });
+    exam.teacherId = exam.teacherId && exam.teacherId.length <= 12 ? exam.teacherId : identity.teacherId;
+    exam.teacherEmail = exam.teacherEmail || identity.teacherEmail;
+    exam.teacherName = exam.teacherName || identity.teacherName;
+    exam.createdBy = exam.createdBy && exam.createdBy.length <= 12 ? exam.createdBy : identity.createdBy;
+
+    const examRef = doc(db, 'exams', exam.id);
+    const { submissionsCount, completedCount, ...examPayloadToSave } = exam as any;
+    const cleanedPayload = removeUndefined({
+      ...examPayloadToSave,
+      teacherId: exam.teacherId,
+      teacherEmail: exam.teacherEmail,
+      teacherName: exam.teacherName,
+      createdBy: exam.createdBy,
+      grade: normalizedGrade,
+      updatedAt: new Date().toISOString()
+    });
+
+    console.log(`[DEBUG] Saving Exam to Firestore:`, {
+      docId: exam.id,
+      payload: cleanedPayload
+    });
+
+    try {
+      await trackedSetDoc(examRef, cleanedPayload, { merge: true });
+    } catch (setDocErr: any) {
+      const errDetails = extractFirestoreErrorDetails(setDocErr);
+      console.error(`❌ [LỖI FIRESTORE TỪ CHỐI LƯU ĐỀ THI KHỐI ${normalizedGrade}]`, {
+        message: errDetails.message,
+        code: errDetails.code,
+        examId: exam.id,
+        grade: normalizedGrade,
+        targetClass: exam.targetClass,
+        payload: cleanedPayload
+      });
+      throw new Error(errDetails.message);
+    }
+
+    // Chờ xác nhận ghi từ máy chủ qua waitForPendingWrites & getDocFromServer
+    const writeResult = await waitForWriteConfirmation(examRef, 12000, false);
+    if (writeResult.success) {
+      console.log(`💾 [Máy chủ xác nhận] Đã lưu đề thi "${exam.title}" (Khối: ${normalizedGrade}, Lớp: ${exam.targetClass}, ID: ${exam.id}) lên Cloud Firestore!`);
+    } else {
+      console.warn(`⚠️ [Chưa xác nhận máy chủ Khối ${normalizedGrade}] ${writeResult.message}`);
+    }
+  } catch (error) {
+    console.error(`❌ [Lỗi giao/lưu đề thi Khối ${exam?.grade || '5'} lên Firestore]:`, error);
+  }
+}
+
+/**
+ * Lấy danh sách Đề kiểm tra chính thức từ Firestore (phân quyền qua `where()` cho giáo viên/học sinh, toàn quyền cho Admin)
+ */
+export async function getExamsFromFirestore(scopeOverride?: ScopeOverride): Promise<ExamPaper[]> {
+  try {
+    if (!db) return getLocalCachedExams();
+
+    const examsSnap = await getScopedDocs('exams', scopeOverride);
+    if (examsSnap && !examsSnap.empty) {
+      const exams: ExamPaper[] = [];
+      examsSnap.forEach(docSnap => {
+        const data = docSnap.data();
+        const examObj = { id: docSnap.id, ...data } as ExamPaper;
+        if (isValidOfficialExam(examObj)) {
+          exams.push(examObj);
+        }
+      });
+      const clean = deduplicateExams(exams);
+      saveExamsToLocalStorage(clean);
+      return clean;
+    }
+
+    if (examsSnap) {
+      saveExamsToLocalStorage([]);
+      return [];
+    }
+    return getLocalCachedExams();
+  } catch (error) {
+    console.warn("Lỗi đọc danh sách đề thi từ Firestore:", error);
+    return getLocalCachedExams();
+  }
+}
+
+/**
+ * Đăng ký lắng nghe thời gian thực (Real-time listener) danh sách Đề kiểm tra từ Firestore với `where()` theo phân quyền
+ */
+export function subscribeToExamsFromFirestore(
+  onUpdate: (exams: ExamPaper[]) => void,
+  onError?: (err: any) => void,
+  scopeOverride?: ScopeOverride
+) {
+  if (!db || isFirestoreQuotaExceeded()) {
+    onUpdate(getLocalCachedExams());
+    return () => {};
+  }
+
+  try {
+    return subscribeScopedCollection(
+      'exams',
+      (snapshot) => {
+        const isFromCache = snapshot.metadata.fromCache;
+        const hasPending = snapshot.metadata.hasPendingWrites;
+
+        updateCollectionCacheStatus('exams', isFromCache, snapshot.size, hasPending);
+
+        if (!snapshot.empty) {
+          const loadedExams: ExamPaper[] = [];
+          snapshot.forEach((docSnap) => {
+            const data = docSnap.data();
+            const examObj = { id: docSnap.id, ...data } as ExamPaper;
+            if (isValidOfficialExam(examObj)) {
+              loadedExams.push(examObj);
+            }
+          });
+          const cleanLoaded = deduplicateExams(loadedExams);
+          cleanLoaded.sort((a, b) => (b.id > a.id ? 1 : -1));
+          saveExamsToLocalStorage(cleanLoaded);
+          onUpdate(cleanLoaded);
+        } else {
+          saveExamsToLocalStorage([]);
+          onUpdate([]);
+        }
+      },
+      (err) => {
+        const msg = err?.message || String(err);
+        const errCode = (err as any)?.code;
+        if (msg.includes('resource-exhausted') || msg.includes('quota') || errCode === 'resource-exhausted') {
+          markFirestoreQuotaExceeded();
+        }
+        console.warn('Lỗi Firestore Live Exam listener:', err);
+        if (onError) onError(err);
+        onUpdate(getLocalCachedExams());
+      },
+      scopeOverride
+    );
+  } catch (err) {
+    console.warn('Lỗi khởi tạo subscribeToExamsFromFirestore:', err);
+    onUpdate(getLocalCachedExams());
+    return () => {};
+  }
+}
+
+// import { deleteSubmissionsByExam } from './cascadeCleanupService';
+
+/**
+ * Xóa một Đề kiểm tra khỏi Firestore
+ */
+export async function deleteExamFromFirestore(examId: string): Promise<void> {
+  try {
+    // Dọn dẹp bài làm dây chuyền trước
+    // await deleteSubmissionsByExam(examId).catch(err => console.error('Lỗi xóa dây chuyền bài làm:', err));
+
+    if (db) {
+      const examRef = doc(db, 'exams', examId);
+      await trackedDeleteDoc(examRef);
+      await waitForWriteConfirmation(examRef, 12000, true);
+      console.log(`🗑️ Đã xóa đề thi ID ${examId} trên Cloud Firestore!`);
+    }
+
+    const current = getLocalCachedExams();
+    const updated = current.filter(e => e?.id !== examId);
+    saveExamsToLocalStorage(updated);
+  } catch (error) {
+    console.error("Lỗi khi xóa đề thi khỏi Firestore:", error);
+    const current = getLocalCachedExams();
+    const updated = current.filter(e => e?.id !== examId);
+    saveExamsToLocalStorage(updated);
+  }
+}
+
+/**
+ * Kiểm tra một đề thi có bị đánh dấu xóa hay không
+ */
+export function isExamDeleted(examId?: string | null): boolean {
+  if (!examId) return false;
+  try {
+    const cached = getLocalCachedExams();
+    const found = cached.find(e => e?.id === examId);
+    return Boolean(found && (found as any)?.isDeleted);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Đánh dấu xóa một đề thi (soft delete)
+ */
+export function markExamDeleted(examId: string): void {
+  if (!examId) return;
+  try {
+    const cached = getLocalCachedExams();
+    const updated = cached.map(e => {
+      if (e?.id === examId) {
+        return { ...e, isDeleted: true, deletedAt: new Date().toISOString() };
+      }
+      return e;
+    });
+    saveExamsToLocalStorage(updated);
+  } catch (err) {
+    console.warn('Lỗi khi đánh dấu xóa đề thi:', err);
+  }
+}
+
+/**
+ * Khôi phục đề thi đã xóa
+ */
+export function restoreDeletedExam(examId: string): void {
+  if (!examId) return;
+  try {
+    const cached = getLocalCachedExams();
+    const updated = cached.map(e => {
+      if (e?.id === examId) {
+        return { ...e, isDeleted: false, deletedAt: undefined };
+      }
+      return e;
+    });
+    saveExamsToLocalStorage(updated);
+  } catch (err) {
+    console.warn('Lỗi khi khôi phục đề thi:', err);
+  }
+}
+
+/**
+ * Lấy thông tin đề thi theo ID
+ */
+export function getExamById(examId: string): ExamPaper | undefined {
+  if (!examId) return undefined;
+  const cached = getLocalCachedExams();
+  return cached.find(e => e?.id === examId);
+}
+
+/**
+ * Gieo mầm thủ công toàn bộ danh sách đề thi mẫu vào LocalStorage và Firestore
+ */
+export async function seedInitialExamsManually(): Promise<ExamPaper[]> {
+  return [];
+}
+
+/**
+ * Xóa sạch cache đề thi trong LocalStorage
+ */
+export function clearAllExamsCache(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.removeItem(EXAMS_CACHE_KEY);
+  } catch (e) {
+    console.warn('Lỗi khi dọn cache đề thi:', e);
+  }
+}
+
+/**
+ * Xóa toàn bộ danh sách Đề kiểm tra khỏi Firestore và dọn dẹp LocalStorage cache
+ */
+export async function deleteAllExamsFromFirestore(): Promise<void> {
+  try {
+    // Dọn dẹp dây chuyền
+    // await cascadeDeleteAllExams().catch(err => console.error('Lỗi dọn dẹp dây chuyền:', err));
+    console.warn('cascadeDeleteAllExams: cascadeCleanupService has been removed.');
+
+    if (db) {
+      const snap = await getDocs(collection(db, 'exams'));
+      if (!snap.empty) {
+        const CHUNK_SIZE = 450;
+        for (let i = 0; i < snap.docs.length; i += CHUNK_SIZE) {
+          const chunk = snap.docs.slice(i, i + CHUNK_SIZE);
+          const batch = trackedWriteBatch(db, { isUserInitiated: true, actionType: 'admin_batch' });
+          chunk.forEach((docSnap) => {
+            batch.delete(doc(db, 'exams', docSnap.id));
+          });
+          await batch.commit();
+        }
+        console.log(`🗑️ Đã xóa sạch toàn bộ ${snap.size} đề thi trên Cloud Firestore bằng writeBatch!`);
+      }
+    }
+    saveExamsToLocalStorage([]);
+  } catch (error) {
+    console.error("Lỗi khi xóa toàn bộ đề thi khỏi Firestore:", error);
+    saveExamsToLocalStorage([]);
+  }
+}
+
+export {
+  exportQuestionsToJSON,
+  importQuestionsFromJSON,
+  seedInitialQuestionsManually,
+  restoreFullQuestionBank
+} from './questionStorageService';
+
+/**
+ * Xuất khẩu danh sách Đề kiểm tra ra file JSON
+ */
+export function exportExamsToJSON(examsInput?: ExamPaper[]): string {
+  const list = examsInput && examsInput.length > 0 ? examsInput : getLocalCachedExams();
+  const jsonStr = JSON.stringify(list, null, 2);
+
+  if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+    try {
+      const blob = new Blob([jsonStr], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `danh_sach_de_thi_eduplay_${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.warn('Lỗi khi tải file JSON đề thi:', e);
+    }
+  }
+
+  return jsonStr;
+}
+
+/**
+ * Nhập khẩu danh sách Đề kiểm tra từ JSON
+ */
+export async function importExamsFromJSON(
+  jsonInput: string | ExamPaper[]
+): Promise<{ success: boolean; count: number; totalCount: number; message: string }> {
+  try {
+    let parsed: any[];
+    if (typeof jsonInput === 'string') {
+      const cleaned = jsonInput.replace(/```json/g, '').replace(/```/g, '').trim();
+      parsed = JSON.parse(cleaned);
+    } else {
+      parsed = jsonInput;
+    }
+
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      return {
+        success: false,
+        count: 0,
+        totalCount: getLocalCachedExams().length,
+        message: 'Dữ liệu JSON đề thi không hợp lệ hoặc rỗng.'
+      };
+    }
+
+    const current = getLocalCachedExams();
+    const idMap = new Map(current.map(e => [e.id, e]));
+
+    parsed.forEach(item => {
+      if (item && item.id) {
+        idMap.set(item.id, item as ExamPaper);
+      }
+    });
+
+    const merged = Array.from(idMap.values());
+    saveExamsToLocalStorage(merged);
+
+    if (db) {
+      const CHUNK_SIZE = 450;
+      for (let i = 0; i < parsed.length; i += CHUNK_SIZE) {
+        const chunk = parsed.slice(i, i + CHUNK_SIZE);
+        const batch = trackedWriteBatch(db, { isUserInitiated: true, actionType: 'admin_batch' });
+        chunk.forEach(exam => {
+          if (exam && exam.id) {
+            const docRef = doc(db, 'exams', exam.id);
+            batch.set(docRef, removeUndefined(exam), { merge: true });
+          }
+        });
+        await batch.commit().catch(console.warn);
+      }
+    }
+
+    return {
+      success: true,
+      count: parsed.length,
+      totalCount: merged.length,
+      message: `Đã nhập thành công ${parsed.length} đề thi vào hệ thống!`
+    };
+  } catch (err: any) {
+    console.error('Lỗi khi nhập đề thi từ JSON:', err);
+    return {
+      success: false,
+      count: 0,
+      totalCount: getLocalCachedExams().length,
+      message: `Lỗi đọc file JSON đề thi: ${err?.message || String(err)}`
+    };
+  }
+}
+
+export function extractExamIdFromPath(pathname?: string): string | null {
+  const path = pathname ?? (typeof window !== 'undefined' ? window.location.pathname : '');
+  const match = path.match(/^\/exam\/([^/?#]+)/i);
+  return match && match[1] ? decodeURIComponent(match[1]) : null;
+}
+
+export async function fetchPublicExamById(examId: string): Promise<{
+  status: 'ok' | 'not_found' | 'error';
+  exam?: ExamPaper;
+  message?: string;
+}> {
+  try {
+    if (!examId) return { status: 'not_found', message: 'Không tìm thấy mã đề kiểm tra.' };
+    const cached = getLocalCachedExams().find(e => e.id === examId);
+    if (!db) {
+      return cached ? { status: 'ok', exam: cached } : { status: 'not_found', message: 'Không tìm thấy đề kiểm tra.' };
+    }
+    const snap = await getDoc(doc(db, 'exams', examId));
+    if (snap.exists()) {
+      return { status: 'ok', exam: { id: snap.id, ...snap.data() } as ExamPaper };
+    }
+    return cached ? { status: 'ok', exam: cached } : { status: 'not_found', message: 'Không tìm thấy đề kiểm tra.' };
+  } catch (e: any) {
+    console.warn('Lỗi fetchPublicExamById:', e);
+    const cached = getLocalCachedExams().find(ex => ex.id === examId);
+    if (cached) return { status: 'ok', exam: cached };
+    return { status: 'error', message: e?.message || 'Lỗi tải đề kiểm tra.' };
+  }
+}
+
+
+
+

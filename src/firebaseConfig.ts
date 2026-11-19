@@ -1,0 +1,290 @@
+import { initializeApp, getApps, getApp, FirebaseApp } from "firebase/app";
+import { getAnalytics, isSupported, Analytics } from "firebase/analytics";
+// import { safeStorage } from "./utils/safeStorage";
+import {
+  getFirestore,
+  initializeFirestore,
+  getDocFromServer,
+  doc,
+  persistentLocalCache,
+  persistentSingleTabManager,
+  Firestore
+} from "firebase/firestore";
+import { getAuth, Auth } from "firebase/auth";
+
+export const firebaseConfig = {
+  apiKey: "AIzaSyCposG8jGC7Z_RsUDd1BCLyLtbCkD6AtAs",
+  authDomain: "dayhockhoi4-fb50c.firebaseapp.com",
+  projectId: "dayhockhoi4-fb50c",
+  storageBucket: "dayhockhoi4-fb50c.firebasestorage.app",
+  messagingSenderId: "790815510589",
+  appId: "1:790815510589:web:226835314651490aa5da54",
+  measurementId: "G-1SSG7WN1KG"
+};
+
+export const app: FirebaseApp = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+
+export let analytics: Analytics | null = null;
+if (typeof window !== 'undefined') {
+  try {
+    isSupported()
+      .then((supported) => {
+        if (supported) {
+          try {
+            analytics = getAnalytics(app);
+          } catch {
+            analytics = null;
+          }
+        }
+      })
+      .catch(() => {
+        analytics = null;
+      });
+  } catch {
+    analytics = null;
+  }
+}
+
+// Khởi tạo Cloud Firestore bằng getFirestore(app) với cơ chế fallback initializeFirestore
+export const db: Firestore = (() => {
+  try {
+    return getFirestore(app);
+  } catch {
+    return initializeFirestore(app, {
+      experimentalAutoDetectLongPolling: true,
+      localCache: persistentLocalCache({
+        tabManager: persistentSingleTabManager({})
+      }),
+    });
+  }
+})();
+
+export const auth: Auth = getAuth(app);
+
+// Bộ đếm số lần xảy ra Internal Assertion trong phiên
+export let sessionInternalAssertionCount = 0;
+
+export function getSessionInternalAssertionCount(): number {
+  return sessionInternalAssertionCount;
+}
+
+const QUOTA_EXCEEDED_KEY = 'eduplay_k4_firestore_quota_v2_exceeded';
+const QUOTA_TIMESTAMP_KEY = 'eduplay_k4_firestore_quota_v2_timestamp';
+const QUOTA_EXPIRATION_MS = 2 * 60 * 60 * 1000;
+const LAST_PROJECT_KEY = 'eduplay_k4_firebase_current_project';
+
+// Tự động kiểm tra và xóa sạch bộ đếm quota khi chuyển sang project mới
+if (typeof window !== 'undefined') {
+  try {
+    const currentProject = firebaseConfig.projectId;
+    const lastProject = localStorage.getItem(LAST_PROJECT_KEY);
+    if (lastProject !== currentProject) {
+      localStorage.setItem(LAST_PROJECT_KEY, currentProject);
+      localStorage.removeItem(QUOTA_EXCEEDED_KEY);
+      localStorage.removeItem(QUOTA_TIMESTAMP_KEY);
+      localStorage.removeItem('eduplay_k4_firestore_quota_exceeded');
+      localStorage.removeItem('eduplay_k4_firestore_quota_timestamp');
+      localStorage.removeItem('eduplay_k4_firestore_write_stats');
+      localStorage.removeItem('eduplay_k4_cached_questions');
+      localStorage.removeItem('eduplay_k4_cached_exams');
+      localStorage.removeItem('eduplay_k4_cached_assignments');
+      localStorage.removeItem('eduplay_k4_5e_lessons');
+      localStorage.removeItem('eduplay_k4_cached_games');
+      localStorage.removeItem('eduplay_k4_questions_db_initialized');
+      localStorage.removeItem('eduplay_k4_elearning_assigned_lessons');
+      console.log(`[FirebaseConfig] Đã kích hoạt project mới: ${currentProject}. Đã xóa sạch bộ đếm Quota & cache cũ.`);
+    }
+  } catch {}
+}
+
+export function isFirestoreQuotaExceeded(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    const isExceeded = localStorage.getItem(QUOTA_EXCEEDED_KEY) === 'true';
+    if (!isExceeded) return false;
+
+    const timestampStr = localStorage.getItem(QUOTA_TIMESTAMP_KEY);
+    if (timestampStr) {
+      const timestamp = parseInt(timestampStr, 10);
+      if (!isNaN(timestamp) && Date.now() - timestamp > QUOTA_EXPIRATION_MS) {
+        localStorage.removeItem(QUOTA_EXCEEDED_KEY);
+        localStorage.removeItem(QUOTA_TIMESTAMP_KEY);
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function markFirestoreQuotaExceeded(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(QUOTA_EXCEEDED_KEY, 'true');
+    localStorage.setItem(QUOTA_TIMESTAMP_KEY, Date.now().toString());
+    window.dispatchEvent(new CustomEvent('eduplay_firestore_network_status_changed', {
+      detail: { quotaExceeded: true, online: false }
+    }));
+  } catch {}
+}
+
+export async function resetFirestoreQuotaAndEnableNetwork(): Promise<boolean> {
+  if (typeof window !== 'undefined') {
+    try {
+      localStorage.removeItem(QUOTA_EXCEEDED_KEY);
+      localStorage.removeItem(QUOTA_TIMESTAMP_KEY);
+      localStorage.removeItem('eduplay_k4_firestore_quota_exceeded');
+      localStorage.removeItem('eduplay_k4_firestore_quota_timestamp');
+      localStorage.removeItem('eduplay_k4_firestore_write_stats');
+    } catch {}
+  }
+  window.dispatchEvent(new CustomEvent('eduplay_firestore_network_status_changed', {
+    detail: { quotaExceeded: false, online: true }
+  }));
+  return true;
+}
+
+export async function testFirestoreServerConnectionOnBoot(): Promise<boolean> {
+  if (!db) return false;
+  try {
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('PING_TIMEOUT')), 4000)
+    );
+    const testDocRef = doc(db, '_system_check_', 'ping');
+    await Promise.race([getDocFromServer(testDocRef), timeoutPromise]);
+    await resetFirestoreQuotaAndEnableNetwork();
+    return true;
+  } catch (err: any) {
+    if (err?.code === 'resource-exhausted' || err?.code === 'functions/resource-exhausted') {
+      markFirestoreQuotaExceeded();
+      return false;
+    }
+    return true;
+  }
+}
+
+function safeStringifyArg(arg: any): string {
+  if (!arg) return '';
+  if (typeof arg === 'string') return arg;
+  if (arg instanceof Error) {
+    const ctx = (arg as any).context || (arg as any).el;
+    return `${arg.name} ${arg.message} ${arg.stack || ''} ${ctx ? safeStringifyArg(ctx) : ''}`;
+  }
+  try {
+    return JSON.stringify(arg, (key, val) => {
+      if (val instanceof Error) {
+        return `${val.name} ${val.message} ${val.stack || ''}`;
+      }
+      return val;
+    });
+  } catch {
+    return String(arg);
+  }
+}
+
+function isFirestoreAssertionError(str: string): boolean {
+  return (
+    str.includes('INTERNAL ASSERTION FAILED') ||
+    str.includes('Unexpected state') ||
+    str.includes('ca9') ||
+    str.includes('b815') ||
+    str.includes('c050') ||
+    str.includes('WatchChangeAggregator')
+  );
+}
+
+function isWebSocketError(str: string): boolean {
+  return (
+    str.includes('WebSocket') ||
+    str.includes('closed without opened') ||
+    str.includes('failed to connect to websocket')
+  );
+}
+
+// Bắt lỗi toàn cục CHỈ ghi log & hiển thị biểu ngữ cảnh báo rõ ràng cho người dùng, KHÔNG ẩn lỗi
+if (typeof window !== 'undefined') {
+  const originalConsoleError = console.error;
+  console.error = (...args: any[]) => {
+    const errorString = args.map(safeStringifyArg).join(' ');
+
+    if (isWebSocketError(errorString)) {
+      return; // Suppress Vite HMR WebSocket error in iframe sandbox
+    }
+
+    originalConsoleError.apply(console, args);
+  };
+
+  window.addEventListener('unhandledrejection', (event) => {
+    const reason = event.reason;
+    const errorString = safeStringifyArg(reason);
+
+    if (isWebSocketError(errorString)) {
+      event.preventDefault();
+      try { (event as any).stopImmediatePropagation?.(); } catch {}
+      return;
+    }
+
+    if (isFirestoreAssertionError(errorString)) {
+      sessionInternalAssertionCount++;
+      console.warn('⚠️ [Firestore INTERNAL ASSERTION FAILED Log]:', reason);
+      window.dispatchEvent(new CustomEvent('eduplay_firestore_assertion_error', {
+        detail: {
+          message: 'Kết nối dữ liệu gặp sự cố, dữ liệu có thể chưa được lưu. Bấm để tải lại trang',
+          rawError: errorString
+        }
+      }));
+    }
+  });
+
+  window.addEventListener('error', (event) => {
+    const errorString = safeStringifyArg(event.error) + ' ' + safeStringifyArg(event.message);
+
+    if (isWebSocketError(errorString)) {
+      event.preventDefault();
+      try { (event as any).stopImmediatePropagation?.(); } catch {}
+      return;
+    }
+
+    if (isFirestoreAssertionError(errorString)) {
+      sessionInternalAssertionCount++;
+      console.warn('⚠️ [Firestore INTERNAL ASSERTION FAILED Window Error Log]:', event.error || event.message);
+      window.dispatchEvent(new CustomEvent('eduplay_firestore_assertion_error', {
+        detail: {
+          message: 'Kết nối dữ liệu gặp sự cố, dữ liệu có thể chưa được lưu. Bấm để tải lại trang',
+          rawError: errorString
+        }
+      }));
+    }
+  });
+
+  setTimeout(() => {
+    testFirestoreServerConnectionOnBoot().catch(() => {});
+    
+    // Cleanup old localStorage keys
+    const CLEANUP_FLAG = 'eduplay_k4_storage_v2_initialized';
+    if (!localStorage.getItem(CLEANUP_FLAG)) {
+      const keysToKeep = [
+        'eduplay_k4_teacher_email',
+        'eduplay_k4_teacher_name',
+        'eduplay_k4_student_session',
+        'eduplay_k4_gemini_api_key',
+        'eduplay_k4_selected_academic_year',
+        'eduplay_k4_selected_semester',
+        LAST_PROJECT_KEY,
+        QUOTA_EXCEEDED_KEY,
+        QUOTA_TIMESTAMP_KEY,
+        CLEANUP_FLAG
+      ];
+      
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith('eduplay_k4_') && !keysToKeep.includes(key)) {
+        localStorage.removeItem(key);
+        }
+      }
+      localStorage.setItem(CLEANUP_FLAG, 'true');
+      console.log('[LocalStorage] Đã dọn dẹp các khóa cũ.');
+    }
+  }, 1000);
+}
