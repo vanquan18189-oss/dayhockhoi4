@@ -103,7 +103,9 @@ import {
   getYearEndResult,
   saveYearEndResult,
   isExcludedK4Class,
-  purgeLegacy4A4BFromStorageAndFirestore
+  purgeLegacy4A4BFromStorageAndFirestore,
+  purgeAllGrade4StudentsEverywhere,
+  K4_STUDENTS_RESET_VERSION
 } from '../../services/studentStorageService';
 import { useAcademicYear } from '../../contexts/AcademicYearContext';
 import {
@@ -318,78 +320,7 @@ export const reindexClassStudents = (students: StudentRecord[], className: strin
   return deduplicateAndNormalizeStudents(students, className);
 };
 
-// Helper to generate mock students
-const generateMockStudents = (className: string, totalCount: number, maleCount: number): StudentRecord[] => {
-  if (totalCount === 0) return [];
-  
-  const maleNames = [
-    'Nguyễn Văn An', 'Trần Đức Bảo', 'Lê Minh Cường', 'Phạm Quốc Dũng', 'Hoàng Văn Đức',
-    'Vũ Gia Huy', 'Bùi Hoàng Nam', 'Đỗ Minh Triết', 'Ngô Thành Vinh', 'Trịnh Đức Anh',
-    'Đặng Bảo Nam', 'Võ Văn Kiệt', 'Nguyễn Nhật Minh', 'Phạm Hải Đăng', 'Dương Quốc Trung',
-    'Nguyễn Khánh Nam', 'Đào Minh Quân', 'Hồ Văn Hùng', 'Nguyễn Gia Bảo', 'Trịnh Hoàng Long',
-    'Lương Văn Phúc', 'Mai Xuân Lộc', 'Cao Văn Thắng', 'Phan Văn Hải', 'Trần Tuấn Kiệt'
-  ];
-  const femaleNames = [
-    'Lê Thị Mai', 'Trần Phương Thảo', 'Phạm Ngọc Anh', 'Nguyễn Khánh Linh', 'Hoàng Thùy Linh',
-    'Bùi Bảo Ngọc', 'Đỗ Quỳnh Anh', 'Ngô Thanh Hà', 'Vũ Phương Anh', 'Trịnh Thu Hà',
-    'Nguyễn Hoài An', 'Đặng Linh Chi', 'Võ Minh Châu', 'Nguyễn Ngọc Mai', 'Phạm Yến Nhi',
-    'Hoàng Mỹ Duyên', 'Đào Thị Hồng', 'Trịnh Bảo Trang', 'Bùi Ngọc Yến', 'Vũ Thị Dung'
-  ];
-
-  const animalPresetUrls = [FOX_AVATAR_URL, RABBIT_AVATAR_URL, LION_AVATAR_URL, PANDA_AVATAR_URL, CAT_AVATAR_URL];
-
-  const students: StudentRecord[] = [];
-  let maleIdx = 0;
-  let femaleIdx = 0;
-
-  for (let i = 1; i <= totalCount; i++) {
-    const isMale = i <= maleCount;
-    const name = isMale
-      ? maleNames[maleIdx++ % maleNames.length]
-      : femaleNames[femaleIdx++ % femaleNames.length];
-    
-    const gender: 'Nam' | 'Nữ' = isMale ? 'Nam' : 'Nữ';
-    const day = String((i % 28) + 1).padStart(2, '0');
-    const month = String((i % 12) + 1).padStart(2, '0');
-    const year = className.includes('1') ? '2018' : className.includes('2') ? '2017' : className.includes('3') ? '2016' : className.includes('4') ? '2015' : '2014';
-    const score = 0;
-
-    // Generate SĐDCN (12 digits e.g. 038316001001)
-    const sddcn = `03831600${String(1000 + i).slice(-4)}`;
-
-    // Generate phone number (matching exact sample phones for first items)
-    let phone = `098${Math.floor(1000000 + ((i * 3571) % 8999999)).toString().padStart(7, '0')}`;
-    if (i === 1) phone = '0982957979';
-    if (i === 2) phone = '0985608063';
-    if (i === 3) phone = '0987763745';
-    if (i === 4) phone = '0985438563';
-
-    // Generate email (matching prompt standard e.g. hs.nguyenvanan@quanghungpk1.edu.vn)
-    const slug = toSlugName(name);
-    const email = i === 1 ? 'hs.nguyenvanan@quanghungpk1.edu.vn' : `hs.${slug}@quanghungpk1.edu.vn`;
-
-    students.push({
-      id: `std-${className.replace(/\s+/g, '')}-${i}`,
-      stt: i,
-      code: generateStudentCode(className, i),
-      pin: '123456',
-      sddcn,
-      name,
-      gender,
-      dob: `${day}/${month}/${year}`,
-      className,
-      parentName: `${isMale ? 'Nguyễn' : 'Trần'} Văn ${name.split(' ').slice(-1)[0]}`,
-      phone,
-      email,
-      status: 'active',
-      conduct: i % 7 === 0 ? 'Khá' : 'Tốt',
-      avgScore: score,
-      notes: i % 3 === 0 ? 'Phát biểu hăng hái, hòa đồng' : 'Ngoan ngoãn, hoàn thành bài tập đầy đủ',
-      avatar: animalPresetUrls[(i - 1) % animalPresetUrls.length]
-    });
-  }
-  return students;
-};
+// Đã gỡ bỏ bộ sinh học sinh mẫu để đảm bảo dữ liệu học sinh Khối 4 hoàn toàn sạch khi nhập mới.
 
 export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
   users,
@@ -545,19 +476,20 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
   });
   const [isStudentsLoading, setIsStudentsLoading] = useState<boolean>(true);
 
-  // 1. Initial Mount Sync: Load from LocalStorage and setup real-time Firestore listeners
+  // 1. Initial Mount Sync: Run one-time Grade 4 student purge, then sync LocalStorage & Firestore
   useEffect(() => {
-    purgeLegacy4A4BFromStorageAndFirestore().catch(() => {});
+    let isMounted = true;
+    (async () => {
+      try {
+        await purgeLegacy4A4BFromStorageAndFirestore();
+        await purgeAllGrade4StudentsEverywhere({ force: false });
 
-    const localDb = getAllStudentsFromLocalStorage();
-    if (Object.keys(localDb).length > 0) {
-      setStudentDatabase(localDb);
-      setIsStudentsLoading(false);
-    }
+        if (!isMounted) return;
+        const localDb = getAllStudentsFromLocalStorage();
+        setStudentDatabase(localDb);
 
-    // Proactively fetch all class rosters in parallel from Firestore to prevent timing issues
-    fetchAllStudentsFromFirestore()
-      .then((remoteDb) => {
+        const remoteDb = await fetchAllStudentsFromFirestore();
+        if (!isMounted) return;
         if (remoteDb && Object.keys(remoteDb).length > 0) {
           setStudentDatabase((prev) => {
             const next = { ...prev, ...remoteDb };
@@ -566,12 +498,15 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
             });
             return next;
           });
+        } else {
+          setStudentDatabase(getAllStudentsFromLocalStorage());
         }
-        setIsStudentsLoading(false);
-      })
-      .catch(() => {
-        setIsStudentsLoading(false);
-      });
+      } catch {
+        // An toàn khi ngoại tuyến
+      } finally {
+        if (isMounted) setIsStudentsLoading(false);
+      }
+    })();
 
     let unsubClasses: (() => void) | null = null;
     let unsubRosters: (() => void) | null = null;
@@ -664,6 +599,8 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
               return next;
             });
             saveAllStudentsToLocalStorage(cloudRosters);
+          } else {
+            setStudentDatabase({});
           }
           setIsStudentsLoading(false);
         },
@@ -721,17 +658,32 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
     }
 
     // Listen to live updates from other components / tabs
-    const handleUpdateEvent = () => {
+    const handleUpdateEvent = (evt: Event) => {
+      const customEvt = evt as CustomEvent;
+      if (customEvt?.detail?.action === 'all-cleared') {
+        const targetClass = customEvt?.detail?.className;
+        if (targetClass) {
+          const std = getStandardClassName(targetClass);
+          const key = normalizeClassKey(targetClass);
+          setStudentDatabase((prev) => ({
+            ...prev,
+            [targetClass]: [],
+            [std]: [],
+            [key]: []
+          }));
+        } else {
+          setStudentDatabase({});
+        }
+        return;
+      }
       const updatedDb = getAllStudentsFromLocalStorage();
-      setStudentDatabase((prev) => ({
-        ...prev,
-        ...updatedDb
-      }));
+      setStudentDatabase(updatedDb);
     };
     window.addEventListener('student-data-updated', handleUpdateEvent);
     window.addEventListener('eduplay_students_updated', handleUpdateEvent);
 
     return () => {
+      isMounted = false;
       window.removeEventListener('student-data-updated', handleUpdateEvent);
       window.removeEventListener('eduplay_students_updated', handleUpdateEvent);
       if (unsubClasses) unsubClasses();
@@ -866,6 +818,8 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
   // Clear all students state
   const [isConfirmClearAllStudentsOpen, setIsConfirmClearAllStudentsOpen] = useState(false);
   const [isClearingAllStudents, setIsClearingAllStudents] = useState(false);
+  const [isConfirmWipeAllK4StudentsOpen, setIsConfirmWipeAllK4StudentsOpen] = useState(false);
+  const [isWipingAllK4Students, setIsWipingAllK4Students] = useState(false);
 
   // Admin Class Deduplication Tool State
   const [isDedupModalOpen, setIsDedupModalOpen] = useState(false);
@@ -967,6 +921,7 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
             male: 0,
             female: 0,
             students: [],
+            resetVersion: K4_STUDENTS_RESET_VERSION,
             updatedAt: new Date().toISOString()
           }, { merge: true });
 
@@ -979,6 +934,7 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
               male: 0,
               female: 0,
               students: [],
+              resetVersion: K4_STUDENTS_RESET_VERSION,
               updatedAt: new Date().toISOString()
             }, { merge: true });
           }
@@ -1008,6 +964,30 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
     } finally {
       setIsClearingAllStudents(false);
       setIsConfirmClearAllStudentsOpen(false);
+    }
+  };
+
+  const handleConfirmWipeAllK4Students = async () => {
+    if (userRole === 'student') {
+      showToast('Bạn không có quyền xóa dữ liệu học sinh Khối 4!', 'error');
+      setIsConfirmWipeAllK4StudentsOpen(false);
+      return;
+    }
+
+    setIsWipingAllK4Students(true);
+    try {
+      const res = await purgeAllGrade4StudentsEverywhere({ force: true });
+      setStudentDatabase({});
+      if (res.success) {
+        showToast('Đã xóa sạch toàn bộ học sinh Khối 4 ở cả bộ nhớ cục bộ và Firestore! Sẵn sàng nhập mới hoàn toàn.', 'success');
+      } else {
+        showToast(`Đã xóa dữ liệu học sinh Khối 4 cục bộ. Lưu ý Firestore: ${res.error || 'không thể đồng bộ'}`, 'error');
+      }
+    } catch (err: any) {
+      showToast(`Lỗi khi xóa toàn bộ học sinh Khối 4: ${err?.message || String(err)}`, 'error');
+    } finally {
+      setIsWipingAllK4Students(false);
+      setIsConfirmWipeAllK4StudentsOpen(false);
     }
   };
 
@@ -2050,6 +2030,15 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
                         <Database className="w-4 h-4" /> Kiểm tra & Dọn trùng lớp
                       </button>
                     )}
+                    <button
+                      type="button"
+                      onClick={() => setIsConfirmWipeAllK4StudentsOpen(true)}
+                      disabled={isWipingAllK4Students}
+                      className="px-4 py-2.5 rounded-xl text-xs font-bold bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white transition-all shadow-md flex items-center gap-2 cursor-pointer active:scale-95 whitespace-nowrap"
+                      title="Xóa sạch toàn bộ học sinh Khối 4 ở cả bộ nhớ cục bộ và Firestore để nhập mới hoàn toàn"
+                    >
+                      <Trash2 className="w-4 h-4" /> Xóa toàn bộ HS Khối 4
+                    </button>
                     <button
                       type="button"
                       onClick={async () => {
@@ -4098,6 +4087,21 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
         confirmLabel="Xác nhận xóa"
         cancelLabel="Hủy bỏ"
         isDeleting={isClearingAllStudents}
+      />
+
+      {/* MODAL XÁC NHẬN XÓA TOÀN BỘ HỌC SINH KHỐI 4 */}
+      <ConfirmDeleteModal
+        isOpen={isConfirmWipeAllK4StudentsOpen}
+        onClose={() => {
+          setIsConfirmWipeAllK4StudentsOpen(false);
+          setIsWipingAllK4Students(false);
+        }}
+        onConfirm={handleConfirmWipeAllK4Students}
+        title="Xác nhận xóa toàn bộ học sinh Khối 4"
+        description="Thao tác này sẽ xóa sạch toàn bộ danh sách học sinh của tất cả các lớp Khối 4 trên cả trình duyệt và Firestore để thầy/cô nhập mới hoàn toàn. Bạn có chắc chắn muốn tiếp tục không?"
+        confirmLabel="Xóa sạch toàn bộ HS Khối 4"
+        cancelLabel="Hủy bỏ"
+        isDeleting={isWipingAllK4Students}
       />
 
 

@@ -26,6 +26,275 @@ export function isExcludedK4Class(classNameOrId?: string): boolean {
   return key === '4A' || key === '4B';
 }
 
+export const K4_STUDENTS_RESET_VERSION = 'k4_fresh_reset_20261119';
+export const K4_STUDENTS_WIPED_LOCAL_KEY = 'eduplay_k4_all_students_wiped_20261119';
+
+function isGrade4ClassKey(raw?: string): boolean {
+  if (!raw) return false;
+  let s = String(raw).trim().replace(/\s+/g, ' ');
+  while (/^(lớp|lop|khối|khoi)\b[\s:_-]*/i.test(s)) {
+    s = s.replace(/^(lớp|lop|khối|khoi)\b[\s:_-]*/i, '').trim();
+  }
+  const upper = s.replace(/\s+/g, '').toUpperCase();
+  return /^4[A-Z0-9]*$/.test(upper) || upper === '4';
+}
+
+/**
+ * Xóa toàn bộ dữ liệu học sinh Khối 4 đang lưu trong LocalStorage, SessionStorage
+ * và Firestore (class_rosters, students, student_enrollments) để nhập mới hoàn toàn.
+ * - Khi force = false (mặc định khi khởi chạy): chỉ chạy 1 lần dựa theo resetVersion trên Firestore
+ *   và cờ cục bộ, tuyệt đối không xóa lại học sinh mới mà giáo viên vừa nhập.
+ * - Khi force = true (giáo viên bấm nút xóa toàn bộ): xóa sạch ngay lập tức cả local lẫn Firestore.
+ */
+export async function purgeAllGrade4StudentsEverywhere(
+  options: { force?: boolean } = {}
+): Promise<{
+  success: boolean;
+  wipedLocal: boolean;
+  wipedFirestore: boolean;
+  deletedDocsCount: number;
+  error?: string;
+}> {
+  const force = Boolean(options.force);
+  let wipedLocal = false;
+  let wipedFirestore = false;
+  let deletedDocsCount = 0;
+
+  // 1. Xóa sạch dữ liệu học sinh trong LocalStorage & SessionStorage
+  if (typeof window !== 'undefined') {
+    try {
+      const alreadyWipedLocal = localStorage.getItem(K4_STUDENTS_WIPED_LOCAL_KEY) === 'true';
+      if (force || !alreadyWipedLocal) {
+        const localKeysToRemove: string[] = [];
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (!key) continue;
+          if (
+            key === EDUPLAY_STUDENTS_DB_KEY ||
+            key === EDUPLAY_STUDENT_ENROLLMENTS_KEY ||
+            key.startsWith('eduplay_k4_students_') ||
+            key.startsWith('eduplay_students_') ||
+            key.startsWith('eduplay_k4_cleared_') ||
+            key.startsWith('eduplay_k4_student_game_profile') ||
+            key === 'eduplay_k4_student_session' ||
+            key === 'eduplay_student_session'
+          ) {
+            localKeysToRemove.push(key);
+          }
+        }
+        localKeysToRemove.forEach((k) => {
+          try {
+            localStorage.removeItem(k);
+          } catch {}
+        });
+
+        try {
+          const sessionKeysToRemove: string[] = [];
+          for (let i = 0; i < sessionStorage.length; i++) {
+            const key = sessionStorage.key(i);
+            if (!key) continue;
+            if (
+              key.startsWith('eduplay_k4_students_') ||
+              key.startsWith('eduplay_students_') ||
+              key === 'eduplay_k4_student_session' ||
+              key === 'eduplay_student_session'
+            ) {
+              sessionKeysToRemove.push(key);
+            }
+          }
+          sessionKeysToRemove.forEach((k) => {
+            try {
+              sessionStorage.removeItem(k);
+            } catch {}
+          });
+        } catch {}
+
+        localStorage.setItem(EDUPLAY_STUDENTS_DB_KEY, JSON.stringify({}));
+        localStorage.setItem(EDUPLAY_STUDENT_ENROLLMENTS_KEY, JSON.stringify([]));
+        localStorage.setItem(K4_STUDENTS_WIPED_LOCAL_KEY, 'true');
+        wipedLocal = true;
+      }
+    } catch (e) {
+      console.warn('Cảnh báo khi dọn dữ liệu học sinh Khối 4 trong bộ nhớ cục bộ:', e);
+    }
+  }
+
+  // 2. Xóa sạch dữ liệu học sinh Khối 4 trên Firestore (class_rosters, students, student_enrollments)
+  if (db) {
+    try {
+      let alreadyWipedFirestore = false;
+      const grade4RosterDocIds = new Set<string>(['4C', '4D']);
+      const rosterDocsToDelete = new Set<string>(['4A', '4B', '4a', '4b', '4c', '4d', 'Lớp 4A', 'Lớp 4B', 'Lớp 4C', 'Lớp 4D']);
+
+      try {
+        const rostersSnap = await getDocs(collection(db, 'class_rosters'));
+        rostersSnap.forEach((d) => {
+          const data = d.data() || {};
+          const rawName = String(data.className || data.name || data.classKey || d.id || '').trim();
+          const isK4 = isGrade4ClassKey(d.id) || isGrade4ClassKey(rawName) || String(data.grade || '').includes('4');
+          if (!isK4) return;
+
+          if (data.resetVersion === K4_STUDENTS_RESET_VERSION) {
+            alreadyWipedFirestore = true;
+          }
+
+          const normKey = normalizeClassKey(rawName || d.id);
+          if (isExcludedK4Class(normKey) || isExcludedK4Class(d.id)) {
+            rosterDocsToDelete.add(d.id);
+          } else if (d.id !== normKey) {
+            // Bản ghi trùng tên (chữ thường hoặc có tiền tố "Lớp ")
+            rosterDocsToDelete.add(d.id);
+            grade4RosterDocIds.add(normKey);
+          } else {
+            grade4RosterDocIds.add(normKey);
+          }
+        });
+      } catch (readErr) {
+        // Fallback nếu không được phép đọc toàn bộ collection: kiểm tra trực tiếp 4C & 4D
+        try {
+          const snap4C = await getDoc(doc(db, 'class_rosters', '4C'));
+          const snap4D = await getDoc(doc(db, 'class_rosters', '4D'));
+          if (
+            (snap4C.exists() && snap4C.data()?.resetVersion === K4_STUDENTS_RESET_VERSION) ||
+            (snap4D.exists() && snap4D.data()?.resetVersion === K4_STUDENTS_RESET_VERSION)
+          ) {
+            alreadyWipedFirestore = true;
+          }
+        } catch {}
+        console.warn('Cảnh báo khi quét class_rosters:', readErr);
+      }
+
+      if (force || !alreadyWipedFirestore) {
+        const nowIso = new Date().toISOString();
+
+        // 2a. Xóa các bản ghi roster thừa/trùng/4A/4B
+        for (const delId of rosterDocsToDelete) {
+          try {
+            await trackedDeleteDoc(doc(db, 'class_rosters', delId));
+            deletedDocsCount++;
+          } catch {}
+        }
+
+        // 2b. Reset các lớp Khối 4 hiện hành (4C, 4D, ...) về 0 học sinh & gắn cờ resetVersion
+        for (const classKey of grade4RosterDocIds) {
+          if (isExcludedK4Class(classKey)) continue;
+          const stdName = getStandardClassName(classKey);
+          try {
+            await trackedSetDoc(
+              doc(db, 'class_rosters', classKey),
+              {
+                className: stdName,
+                classKey,
+                totalStudents: 0,
+                male: 0,
+                female: 0,
+                students: [],
+                resetVersion: K4_STUDENTS_RESET_VERSION,
+                updatedAt: nowIso
+              },
+              { merge: false }
+            );
+          } catch (setErr) {
+            console.warn(`Cảnh báo khi reset class_rosters/${classKey}:`, setErr);
+          }
+        }
+
+        // 2c. Xóa toàn bộ bản ghi cá nhân trong collection 'students' thuộc Khối 4
+        try {
+          const studentDocRefsToDelete: any[] = [];
+          try {
+            const studentsSnap = await getDocs(collection(db, 'students'));
+            studentsSnap.forEach((d) => {
+              const sData = d.data() || {};
+              const cls = String(sData.className || sData.class || sData.classId || sData.lop || '');
+              const grade = String(sData.grade || '');
+              const code = String(sData.code || sData.studentCode || '');
+              if (
+                isGrade4ClassKey(cls) ||
+                grade.includes('4') ||
+                /^4[A-Z]/i.test(code) ||
+                !cls
+              ) {
+                studentDocRefsToDelete.push(d.ref);
+              }
+            });
+          } catch {
+            // Fallback bằng truy vấn where() theo các lớp Khối 4
+            const k4Variants = ['Lớp 4A', 'Lớp 4B', 'Lớp 4C', 'Lớp 4D', '4A', '4B', '4C', '4D'];
+            const qStudents = query(collection(db, 'students'), where('className', 'in', k4Variants));
+            const qSnap = await getDocs(qStudents);
+            qSnap.forEach((d) => studentDocRefsToDelete.push(d.ref));
+          }
+
+          for (let i = 0; i < studentDocRefsToDelete.length; i += 400) {
+            const chunk = studentDocRefsToDelete.slice(i, i + 400);
+            const batch = trackedWriteBatch(db);
+            chunk.forEach((ref) => batch.delete(ref));
+            await batch.commit();
+            deletedDocsCount += chunk.length;
+          }
+        } catch (stErr) {
+          console.warn('Cảnh báo khi xóa collection students Khối 4:', stErr);
+        }
+
+        // 2d. Xóa toàn bộ hồ sơ phân lớp trong 'student_enrollments' thuộc Khối 4
+        try {
+          const enrollmentRefsToDelete: any[] = [];
+          const enrollmentsSnap = await getDocs(collection(db, 'student_enrollments'));
+          enrollmentsSnap.forEach((d) => {
+            const eData = d.data() || {};
+            const cls = String(eData.classId || eData.className || '');
+            if (isGrade4ClassKey(cls) || !cls) {
+              enrollmentRefsToDelete.push(d.ref);
+            }
+          });
+          for (let i = 0; i < enrollmentRefsToDelete.length; i += 400) {
+            const chunk = enrollmentRefsToDelete.slice(i, i + 400);
+            const batch = trackedWriteBatch(db);
+            chunk.forEach((ref) => batch.delete(ref));
+            await batch.commit();
+            deletedDocsCount += chunk.length;
+          }
+        } catch (enrErr) {
+          console.warn('Cảnh báo khi xóa student_enrollments Khối 4:', enrErr);
+        }
+
+        wipedFirestore = true;
+      }
+    } catch (err: any) {
+      console.warn('Cảnh báo khi xóa học sinh Khối 4 trên Firestore:', err);
+      return {
+        success: wipedLocal,
+        wipedLocal,
+        wipedFirestore,
+        deletedDocsCount,
+        error: err?.message || String(err)
+      };
+    }
+  }
+
+  // 3. Phát sự kiện đồng bộ tức thì tới toàn bộ giao diện
+  if ((wipedLocal || wipedFirestore) && typeof window !== 'undefined') {
+    setTimeout(() => {
+      try {
+        window.dispatchEvent(
+          new CustomEvent('student-data-updated', {
+            detail: { action: 'all-cleared', dbData: {}, count: 0, students: [], timestamp: Date.now() }
+          })
+        );
+        window.dispatchEvent(
+          new CustomEvent('eduplay_students_updated', {
+            detail: { action: 'all-cleared', count: 0 }
+          })
+        );
+        window.dispatchEvent(new CustomEvent('eduplay_enrollments_updated'));
+      } catch {}
+    }, 0);
+  }
+
+  return { success: true, wipedLocal, wipedFirestore, deletedDocsCount };
+}
+
 /**
  * Xóa triệt để dữ liệu Lớp 4A và Lớp 4B khỏi LocalStorage, SessionStorage và Firestore (classes, class_rosters)
  */
@@ -322,87 +591,39 @@ export function sortStudentsAscending(students: StudentRecord[]): StudentRecord[
   });
 }
 
-const STANDARD_3C_NAMES = [
-  'Nguyễn Văn An', 'Trần Đức Bảo', 'Lê Minh Cường', 'Phạm Quốc Dũng', 'Hoàng Văn Đức',
-  'Vũ Gia Huy', 'Bùi Hoàng Nam', 'Đỗ Minh Triết', 'Ngô Thành Vinh', 'Trịnh Đức Anh',
-  'Đặng Bảo Nam', 'Võ Văn Kiệt', 'Nguyễn Nhật Minh', 'Phạm Hải Đăng', 'Dương Quốc Trung',
-  'Nguyễn Khánh Nam', 'Đào Minh Quân', 'Hồ Văn Hùng', 'Nguyễn Gia Bảo', 'Trịnh Hoàng Long',
-  'Lê Thị Mai', 'Trần Phương Thảo', 'Phạm Ngọc Anh', 'Nguyễn Khánh Linh', 'Hoàng Thùy Linh',
-  'Bùi Bảo Ngọc', 'Đỗ Quỳnh Anh', 'Ngô Thanh Hà', 'Vũ Phương Anh', 'Trịnh Thu Hà',
-  'Nguyễn Hoài An', 'Đặng Linh Chi', 'Võ Minh Châu', 'Nguyễn Ngọc Mai', 'Phạm Yến Nhi',
-  'Hoàng Mỹ Duyên', 'Đào Thị Hồng', 'Trịnh Bảo Trang'
-];
-
 /**
- * Generate default roster for class 5B
+ * Không tự sinh dữ liệu học sinh mẫu — trả về danh sách rỗng để giáo viên tự nhập mới hoàn toàn
  */
 export function getDefault5BRoster(): StudentRecord[] {
-  return generateDefaultClassRoster('Lớp 5B', 35);
+  return [];
 }
 
-/**
- * Generate default roster for class 5C
- */
 export function getDefault5CRoster(): StudentRecord[] {
-  return generateDefaultClassRoster('Lớp 5C', 35);
+  return [];
 }
 
-/**
- * Generate default roster for class 5D
- */
 export function getDefault5DRoster(): StudentRecord[] {
-  return generateDefaultClassRoster('Lớp 5D', 35);
+  return [];
 }
 
-/**
- * Danh sách học sinh mẫu chuẩn hóa Khối 4 (chỉ dùng khi gọi generateDefaultClassRoster)
- */
 export function getDefault3CRoster(): StudentRecord[] {
   return [];
 }
 
-/**
- * Return roster for any class with standard Student Codes [CLASS]26-27-[STT]
- */
-export function generateDefaultClassRoster(className: string, count: number = 38): StudentRecord[] {
-  const stdName = getStandardClassName(className);
-  const cleanClass = normalizeClassKey(stdName);
-  const actualCount = count > 0 ? count : 38;
-  return Array.from({ length: actualCount }).map((_, idx) => {
-    const stt = idx + 1;
-    const isMale = idx % 2 === 0;
-    const name = STANDARD_3C_NAMES[idx % STANDARD_3C_NAMES.length];
-    return {
-      id: `st-${cleanClass.toLowerCase()}-${stt}`,
-      stt,
-      code: `${cleanClass}26-27-${stt}`,
-      name,
-      fullName: name,
-      gender: isMale ? ('Nam' as const) : ('Nữ' as const),
-      dob: `${String((stt % 28) + 1).padStart(2, '0')}/05/2016`,
-      className: stdName,
-      parentName: `${isMale ? 'Nguyễn' : 'Trần'} Văn ${name.split(' ').slice(-1)[0]}`,
-      phone: `0985${String(100000 + stt * 1357).slice(-6)}`,
-      email: `hs.${cleanClass.toLowerCase()}${stt}@quanghungpk1.edu.vn`,
-      status: 'active' as const,
-      conduct: 'Tốt' as const,
-      avgScore: 8.0,
-      avatar: '🌟',
-      sddcn: `03831600${String(1000 + stt).slice(-4)}`
-    };
-  });
+export function generateDefaultClassRoster(_className: string, _count: number = 0): StudentRecord[] {
+  return [];
 }
 
 /**
- * Tính toán sĩ số thực tế chuẩn xác của lớp dựa trên danh sách học sinh thực tế
+ * Tính toán sĩ số thực tế chuẩn xác của lớp dựa trên danh sách học sinh thực tế (0 nếu chưa có học sinh)
  */
-export function getClassStudentCount(className: string, fallbackCount?: number): number {
-  if (!className) return fallbackCount || 0;
+export function getClassStudentCount(className: string, _fallbackCount?: number): number {
+  if (!className) return 0;
   const roster = getStudentsFromLocalStorage(className);
-  if (roster && Array.isArray(roster) && roster.length > 0) {
+  if (roster && Array.isArray(roster)) {
     return roster.length;
   }
-  return fallbackCount || 38;
+  return 0;
 }
 
 /**
@@ -544,11 +765,11 @@ export function saveAllStudentsToLocalStorage(dbData: Record<string, StudentReco
     const cleanedDb: Record<string, StudentRecord[]> = {};
     Object.entries(dbData).forEach(([clsName, students]) => {
       if (isExcludedK4Class(clsName)) return;
-      if (!Array.isArray(students) || students.length === 0) return;
+      if (!Array.isArray(students)) return;
       const stdName = getStandardClassName(clsName);
       const key = normalizeClassKey(clsName);
       if (isExcludedK4Class(key)) return;
-      const cleaned = deduplicateAndNormalizeStudents(students, stdName);
+      const cleaned = students.length > 0 ? deduplicateAndNormalizeStudents(students, stdName) : [];
       cleanedDb[stdName] = cleaned;
       cleanedDb[key] = cleaned;
       localStorage.setItem(`eduplay_k4_students_${key}`, JSON.stringify(cleaned));
@@ -741,6 +962,24 @@ export function clearAllStudentsInClass(className: string): { success: boolean; 
     localStorage.setItem(EDUPLAY_STUDENTS_DB_KEY, JSON.stringify(fullDb));
 
     syncClassStudentsToFirestore(stdName, []).catch(() => {});
+
+    // Xóa thêm các bản ghi học sinh cá nhân thuộc lớp này trên collection 'students'
+    if (db) {
+      (async () => {
+        try {
+          const classVariants = Array.from(new Set([stdName, classKey, classKey.toLowerCase()]));
+          const qStudents = query(collection(db, 'students'), where('className', 'in', classVariants));
+          const qSnap = await getDocs(qStudents);
+          if (!qSnap.empty) {
+            const batch = trackedWriteBatch(db);
+            qSnap.forEach((d) => batch.delete(d.ref));
+            await batch.commit();
+          }
+        } catch (stErr) {
+          console.warn('Cảnh báo khi xóa bản ghi students của lớp:', stErr);
+        }
+      })();
+    }
 
     window.dispatchEvent(
       new CustomEvent('student-data-updated', {
@@ -946,6 +1185,7 @@ export async function syncClassStudentsToFirestore(
         male: maleCount,
         female: femaleCount,
         students: cleaned,
+        resetVersion: K4_STUDENTS_RESET_VERSION,
         updatedAt: new Date().toISOString()
       },
       { merge: true }

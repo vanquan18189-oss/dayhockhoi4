@@ -6,8 +6,6 @@ import { GoogleAuthProvider, signInWithPopup, signInWithEmailAndPassword, create
 import {
   getStudentsFromLocalStorage,
   getAllStudentsFromLocalStorage,
-  getDefault5BRoster,
-  generateDefaultClassRoster,
   fetchClassStudentsFromFirestore,
   fetchAllStudentsFromFirestore,
   subscribeToFirestoreClassStudents,
@@ -18,7 +16,8 @@ import {
   sortStudentsAscending,
   extractStudentNumericIndex,
   getStandardClassName,
-  normalizeClassKey
+  normalizeClassKey,
+  purgeAllGrade4StudentsEverywhere
 } from '../services/studentStorageService';
 import { resolveTeacherNameByEmail, getCurrentTeacherProfile, verifyTeacherAuthorization } from '../services/teacherStorageService';
 import { useClassesList, normalizeClassKeyStrict, formatClassName } from '../services/classStorageService';
@@ -199,76 +198,6 @@ function getStudentAvatar(index: number) {
   return ANIMAL_AVATARS[index % ANIMAL_AVATARS.length];
 }
 
-// Generate complete student rosters for all classes
-function generateClassRoster(className: string): StudentRecord[] {
-  const prefix = className.replace(/Lớp\s*/i, '').toLowerCase();
-
-  if (className === 'Lớp 5B') {
-    const list5B = [
-      'Hà Nhật An', 'Phạm Lê Khang An', 'Trần Gia An', 'Hoàng Thùy Anh', 'Lê Trần Huyền Anh',
-      'Đồng Gia Bảo', 'Dương Thị Thùy Chi', 'Mai Thành Danh', 'Đoàn Đức Duy', 'Đồng Tiến Đạt',
-      'Đồng Tuấn Đạt', 'Trần Minh Đức', 'Trần Minh Đức', 'Bùi Gia Hân', 'Hà Minh Hân',
-      'Nguyễn Duy Hoan', 'Dương Đức Hùng', 'Đồng Gia Huy', 'Đặng Thanh Thanh Huyền', 'Nguyễn Thị Thu Hường',
-      'Hoàng An Khang', 'Hoàng Nhật Khang', 'Phan Như Mai', 'Hà Thị Kim Ngân', 'Phạm Lê Khánh Ngân',
-      'Đoàn Bảo Ngọc', 'Đồng Hải Nguyên'
-    ];
-    return list5B.map((name, idx) => ({
-      id: `st-5b-${idx + 1}`,
-      stt: idx + 1,
-      code: `${prefix}${idx + 1}`,
-      username: `${prefix}${idx + 1}`,
-      pin: '123456',
-      password: '123456',
-      name,
-      fullName: name,
-      className: 'Lớp 5B',
-      gender: (idx % 2 === 0 ? 'Nam' : 'Nữ') as 'Nam' | 'Nữ',
-      dob: '22/01/2016',
-      sddcn: `0362160${String(10000 + idx).slice(-5)}`,
-      parentName: `Phụ huynh em ${name}`,
-      phone: '0975283013',
-      email: `hs.${prefix}${idx + 1}@quanghungpk1.edu.vn`,
-      status: 'active' as const,
-      conduct: 'Tốt' as const,
-      avgScore: 0,
-      notes: 'Chăm ngoan, tích cực tham gia phát biểu và học tập tốt',
-      avatar: '🐰'
-    }));
-  }
-
-  // Generic roster generator for other classes (e.g. 3A, 3B, 4A, 5A, 1A, 2A...)
-  const sampleNames = [
-    'Hoàng Bảo An', 'Hà Việt Anh', 'Ngô Nhật Hưng', 'Nguyễn Minh Quân',
-    'Hoàng Tuấn Kiệt', 'Đỗ Diệu Linh', 'Phan Tú Uyên', 'Hà Bảo Nam',
-    'Trần Quỳnh Chi', 'Lê Gia Huy', 'Phạm Ngọc Diệp', 'Vũ Khánh Linh',
-    'Bùi Đức Phúc', 'Đặng Mai Phương', 'Trịnh Quốc Bảo', 'Lương Thảo Nguyên',
-    'Cao Tiến Đạt', 'Mai Bảo Châu', 'Nguyễn Phương Thảo', 'Dương Nhật Minh'
-  ];
-
-  return sampleNames.map((name, idx) => ({
-    id: `st-${prefix}-${idx + 1}`,
-    stt: idx + 1,
-    code: `${prefix}${idx + 1}`,
-    username: `${prefix}${idx + 1}`,
-    pin: '123456',
-    password: '123456',
-    name,
-    fullName: name,
-    className,
-    gender: (idx % 2 === 0 ? 'Nam' : 'Nữ') as 'Nam' | 'Nữ',
-    dob: '15/05/2016',
-    sddcn: `03831600${1000 + idx + 1}`,
-    parentName: `Phụ huynh em ${name}`,
-    phone: '0985608063',
-    email: `hs.${prefix}${idx + 1}@quanghungpk1.edu.vn`,
-    status: 'active' as const,
-    conduct: 'Tốt' as const,
-    avgScore: 0,
-    notes: 'Chăm ngoan, làm bài tập đầy đủ',
-    avatar: '🐰'
-  }));
-}
-
 export function PortalView({ onSelectPortal }: PortalViewProps) {
   // Navigation Modes:
   // 'gateway' -> Gateway selection (Student vs Teacher)
@@ -374,15 +303,22 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
     return [];
   });
 
-  // Load all class rosters on mount to populate class & grade counts immediately
+  // Load all class rosters on mount after running one-time Grade 4 student purge
   useEffect(() => {
-    fetchAllStudentsFromFirestore()
-      .then((rosters) => {
-        if (rosters && Object.keys(rosters).length > 0) {
-          setAllClassRosters(rosters);
-        }
-      })
-      .catch(() => {});
+    let mounted = true;
+    (async () => {
+      try {
+        await purgeAllGrade4StudentsEverywhere({ force: false });
+        const rosters = await fetchAllStudentsFromFirestore();
+        if (!mounted) return;
+        setAllClassRosters(rosters && Object.keys(rosters).length > 0 ? rosters : {});
+      } catch {
+        if (mounted) setAllClassRosters({});
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
   }, []);
 
   // Derived sorted student list based on current sort direction (Alphabetical A-Z by default)
@@ -404,23 +340,20 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
 
     const loadClassRoster = () => {
       const cached = getStudentsFromLocalStorage(selectedClass);
-      if (cached && cached.length > 0) {
-        if (isMounted) setCurrentClassStudents(cached);
+      if (isMounted) {
+        setCurrentClassStudents(cached && cached.length > 0 ? cached : []);
       }
 
       fetchClassStudentsFromFirestore(selectedClass)
         .then((cloudStudents) => {
           if (!isMounted) return;
-          if (cloudStudents && cloudStudents.length > 0) {
-            setCurrentClassStudents(cloudStudents);
-            setAllClassRosters((prev) => ({
-              ...prev,
-              [getStandardClassName(selectedClass)]: cloudStudents,
-              [normalizeClassKey(selectedClass)]: cloudStudents
-            }));
-          } else if (!cached || cached.length === 0) {
-            setCurrentClassStudents([]);
-          }
+          const finalList = Array.isArray(cloudStudents) ? cloudStudents : [];
+          setCurrentClassStudents(finalList);
+          setAllClassRosters((prev) => ({
+            ...prev,
+            [getStandardClassName(selectedClass)]: finalList,
+            [normalizeClassKey(selectedClass)]: finalList
+          }));
         })
         .catch(() => {
           if (isMounted && (!cached || cached.length === 0)) {
@@ -433,7 +366,7 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
 
     // Real-time Firestore subscription for immediate live sync
     const unsubscribeSnapshot = subscribeToFirestoreClassStudents(selectedClass, (liveStudents) => {
-      if (isMounted && liveStudents && liveStudents.length > 0) {
+      if (isMounted && Array.isArray(liveStudents)) {
         setCurrentClassStudents(liveStudents);
         setAllClassRosters((prev) => ({
           ...prev,
@@ -445,14 +378,18 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
 
     // Listen to live update event from User Management Module
     const handleUpdate = () => {
+      if (!isMounted) return;
+      setAllClassRosters(getAllStudentsFromLocalStorage());
       loadClassRoster();
     };
     window.addEventListener('eduplay_students_updated', handleUpdate);
+    window.addEventListener('student-data-updated', handleUpdate);
 
     return () => {
       isMounted = false;
       unsubscribeSnapshot();
       window.removeEventListener('eduplay_students_updated', handleUpdate);
+      window.removeEventListener('student-data-updated', handleUpdate);
     };
   }, [selectedClass]);
 
