@@ -11,6 +11,7 @@ import {
   WriteBatch,
   Firestore
 } from 'firebase/firestore';
+import { sanitizeForFirestore } from '../utils/firestoreSanitizer';
 
 export type ActionCategory = 'admin_batch' | 'user_action' | 'background_sync';
 
@@ -293,10 +294,11 @@ export async function trackedSetDoc(
   }
 
   try {
+    const cleanData = sanitizeForFirestore(data);
     if (options) {
-      await setDoc(docRef, data, options);
+      await setDoc(docRef, cleanData, options);
     } else {
-      await setDoc(docRef, data);
+      await setDoc(docRef, cleanData);
     }
   } catch (err: any) {
     const details = extractFirestoreErrorDetails(err);
@@ -327,7 +329,8 @@ export async function trackedAddDoc(
   }
 
   try {
-    return await addDoc(collRef, data);
+    const cleanData = sanitizeForFirestore(data);
+    return await addDoc(collRef, cleanData);
   } catch (err: any) {
     const details = extractFirestoreErrorDetails(err);
     console.error(`❌ [trackedAddDoc Error] ${caller} -> collection "${collectionName}":`, details.message);
@@ -357,7 +360,8 @@ export async function trackedUpdateDoc(
   }
 
   try {
-    await updateDoc(docRef, data);
+    const cleanData = sanitizeForFirestore(data);
+    await updateDoc(docRef, cleanData);
   } catch (err: any) {
     const details = extractFirestoreErrorDetails(err);
     console.error(`❌ [trackedUpdateDoc Error] ${caller} -> collection "${collectionName}":`, details.message);
@@ -408,12 +412,14 @@ export function trackedWriteBatch(db: Firestore, writeOpts?: TrackedWriteOptions
     set: (docRef: any, data: any, options?: any) => {
       opCount++;
       sampleCollection = extractCollectionName(docRef);
-      return options ? realBatch.set(docRef, data, options) : realBatch.set(docRef, data);
+      const cleanData = sanitizeForFirestore(data);
+      return options ? realBatch.set(docRef, cleanData, options) : realBatch.set(docRef, cleanData);
     },
     update: (docRef: any, data: any) => {
       opCount++;
       sampleCollection = extractCollectionName(docRef);
-      return realBatch.update(docRef, data);
+      const cleanData = sanitizeForFirestore(data);
+      return realBatch.update(docRef, cleanData);
     },
     delete: (docRef: any) => {
       opCount++;

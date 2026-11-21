@@ -288,12 +288,25 @@ if (typeof window !== 'undefined') {
         CLEANUP_FLAG
       ];
       
+      const keysToRemove: string[] = [];
       for (let i = 0; i < localStorage.length; i++) {
         const key = localStorage.key(i);
-        if (key && key.startsWith('eduplay_k4_') && !keysToKeep.includes(key)) {
-        localStorage.removeItem(key);
+        if (
+          key &&
+          key.startsWith('eduplay_k4_') &&
+          !keysToKeep.includes(key) &&
+          !key.startsWith('eduplay_k4_students_') &&
+          !key.startsWith('eduplay_k4_classes_') &&
+          key !== 'eduplay_k4_student_enrollments_db'
+        ) {
+          keysToRemove.push(key);
         }
       }
+      keysToRemove.forEach((k) => {
+        try {
+          localStorage.removeItem(k);
+        } catch {}
+      });
       localStorage.setItem(CLEANUP_FLAG, 'true');
       console.log('[LocalStorage] Đã dọn dẹp các khóa cũ.');
     }

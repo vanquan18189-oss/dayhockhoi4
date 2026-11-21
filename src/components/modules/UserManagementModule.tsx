@@ -476,13 +476,12 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
   });
   const [isStudentsLoading, setIsStudentsLoading] = useState<boolean>(true);
 
-  // 1. Initial Mount Sync: Run one-time Grade 4 student purge, then sync LocalStorage & Firestore
+  // 1. Initial Mount Sync: Clean legacy 4A/4B, then sync LocalStorage & Firestore
   useEffect(() => {
     let isMounted = true;
     (async () => {
       try {
         await purgeLegacy4A4BFromStorageAndFirestore();
-        await purgeAllGrade4StudentsEverywhere({ force: false });
 
         if (!isMounted) return;
         const localDb = getAllStudentsFromLocalStorage();
@@ -492,7 +491,7 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
         if (!isMounted) return;
         if (remoteDb && Object.keys(remoteDb).length > 0) {
           setStudentDatabase((prev) => {
-            const next = { ...prev, ...remoteDb };
+            const next = { ...localDb, ...prev, ...remoteDb };
             Object.keys(next).forEach((k) => {
               if (isExcludedK4Class(k)) delete next[k];
             });
@@ -592,15 +591,24 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
           }
           if (Object.keys(cloudRosters).length > 0) {
             setStudentDatabase((prev) => {
-              const next = { ...prev, ...cloudRosters };
+              const next = { ...prev };
+              Object.entries(cloudRosters).forEach(([k, list]) => {
+                const existing = next[k] || [];
+                if (list.length > 0 || existing.length === 0) {
+                  next[k] = list;
+                }
+              });
               Object.keys(next).forEach((k) => {
                 if (isExcludedK4Class(k)) delete next[k];
               });
+              saveAllStudentsToLocalStorage(next);
               return next;
             });
-            saveAllStudentsToLocalStorage(cloudRosters);
           } else {
-            setStudentDatabase({});
+            const localFallback = getAllStudentsFromLocalStorage();
+            if (Object.keys(localFallback).length > 0) {
+              setStudentDatabase((prev) => ({ ...localFallback, ...prev }));
+            }
           }
           setIsStudentsLoading(false);
         },
@@ -676,8 +684,28 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
         }
         return;
       }
+      if (customEvt?.detail?.students && Array.isArray(customEvt.detail.students) && customEvt.detail.className) {
+        const std = getStandardClassName(customEvt.detail.className);
+        const key = normalizeClassKey(customEvt.detail.className);
+        const incoming = customEvt.detail.students as StudentRecord[];
+        setStudentDatabase((prev) => ({
+          ...prev,
+          [customEvt.detail.className]: incoming,
+          [std]: incoming,
+          [key]: incoming
+        }));
+        return;
+      }
       const updatedDb = getAllStudentsFromLocalStorage();
-      setStudentDatabase(updatedDb);
+      setStudentDatabase((prev) => {
+        const merged = { ...prev };
+        Object.entries(updatedDb).forEach(([k, list]) => {
+          if (Array.isArray(list) && (list.length > 0 || !merged[k] || merged[k].length === 0)) {
+            merged[k] = list;
+          }
+        });
+        return merged;
+      });
     };
     window.addEventListener('student-data-updated', handleUpdateEvent);
     window.addEventListener('eduplay_students_updated', handleUpdateEvent);
@@ -696,36 +724,39 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
   useEffect(() => {
     if (!selectedClass) return;
 
-    const currentRoster = studentDatabase[selectedClass];
+    const stdName = getStandardClassName(selectedClass);
+    const classKey = normalizeClassKey(selectedClass);
+    const currentRoster =
+      (studentDatabase[selectedClass]?.length ? studentDatabase[selectedClass] : null) ||
+      (studentDatabase[stdName]?.length ? studentDatabase[stdName] : null) ||
+      (studentDatabase[classKey]?.length ? studentDatabase[classKey] : null);
+
     if (!currentRoster || currentRoster.length === 0) {
-      const cached = getStudentsFromLocalStorage(selectedClass);
+      const cached =
+        getStudentsFromLocalStorage(stdName) ||
+        getStudentsFromLocalStorage(classKey) ||
+        getStudentsFromLocalStorage(selectedClass);
       if (cached && cached.length > 0) {
         setStudentDatabase((prev) => ({
           ...prev,
-          [selectedClass]: cached
+          [selectedClass]: cached,
+          [stdName]: cached,
+          [classKey]: cached
         }));
-      } else {
-        // Try fetching from Firestore first to preserve any imported data
-        fetchClassStudentsFromFirestore(selectedClass).then((firestoreStudents) => {
+      }
+      // Also fetch latest from Firestore to ensure cloud data is loaded
+      fetchClassStudentsFromFirestore(stdName)
+        .then((firestoreStudents) => {
           if (firestoreStudents && firestoreStudents.length > 0) {
             setStudentDatabase((prev) => ({
               ...prev,
-              [selectedClass]: firestoreStudents
+              [selectedClass]: firestoreStudents,
+              [stdName]: firestoreStudents,
+              [classKey]: firestoreStudents
             }));
-          } else {
-            setStudentDatabase((prev) => ({
-              ...prev,
-              [selectedClass]: []
-            }));
-            saveStudentsToLocalStorage(selectedClass, []);
           }
-        }).catch(() => {
-          setStudentDatabase((prev) => ({
-            ...prev,
-            [selectedClass]: []
-          }));
-        });
-      }
+        })
+        .catch(() => {});
     }
   }, [selectedClass]);
 
@@ -1008,24 +1039,50 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
     }, 4000);
   };
 
-  // Select or Drag Excel File (Real parsing with fallback)
+  // Select or Drag Excel File (Real parsing with immediate state & Firestore sync support)
   const handleSelectExcelFile = async (fileObj?: File) => {
     if (fileObj) {
       try {
+        const targetCls = selectedClass || 'Lớp 4C';
+        const stdName = getStandardClassName(targetCls);
+        const classKey = normalizeClassKey(targetCls);
         const buffer = await fileObj.arrayBuffer();
-        const result = importStudentsFromExcel(buffer, selectedClass || 'Lớp 5B');
+        const result = importStudentsFromExcel(buffer, stdName);
         if (result.success && result.students.length > 0) {
-          setParsedStudentsBatch(result.students);
+          const normalizedBatch = reindexClassStudents(
+            result.students.map((s) => ({
+              ...s,
+              code: (s.code || (s as any).studentCode || '').trim().toUpperCase(),
+              studentCode: (s.code || (s as any).studentCode || '').trim().toUpperCase(),
+              className: stdName,
+              classKey
+            })),
+            stdName
+          );
+          setParsedStudentsBatch(normalizedBatch);
           setImportedFile({
             name: fileObj.name,
             size: `${(fileObj.size / 1024).toFixed(1)} KB`,
-            count: result.students.length
+            count: normalizedBatch.length
           });
-          setToastMessage(`✅ Đã đọc thành công ${result.students.length} học sinh từ tệp Excel (${fileObj.name}) khớp nối chuẩn 9 cột!`);
-          setTimeout(() => setToastMessage(null), 3500);
+
+          // Cập nhật ngay state danh sách học sinh và lưu lên LocalStorage + Firestore ngay khi đọc file thành công
+          setStudentDatabase((prev) => ({
+            ...prev,
+            [targetCls]: normalizedBatch,
+            [stdName]: normalizedBatch,
+            [classKey]: normalizedBatch
+          }));
+          saveStudentsToLocalStorage(stdName, normalizedBatch);
+          syncClassStudentsToFirestore(stdName, normalizedBatch).catch((err) => {
+            console.warn('Cảnh báo đồng bộ Firestore tự động khi chọn file Excel:', err);
+          });
+
+          setToastMessage(`✅ Đã nạp & đồng bộ ${normalizedBatch.length} học sinh từ tệp Excel (${fileObj.name}) lên Firestore (class_rosters/${classKey}) cho ${stdName}!`);
+          setTimeout(() => setToastMessage(null), 4500);
           return;
         } else {
-          setToastMessage(`⚠️ Cảnh báo đọc file: ${result.error || 'Cần kiểm tra lại cấu trúc 9 cột tiêu chuẩn.'}`);
+          setToastMessage(`⚠️ Cảnh báo đọc file: ${result.error || 'Không tìm thấy dòng học sinh hợp lệ trong file Excel.'}`);
           setTimeout(() => setToastMessage(null), 4000);
           setParsedStudentsBatch([]);
           setImportedFile(null);
@@ -1046,49 +1103,63 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
   };
 
   // Confirm Excel Import Batch
-  const handleConfirmExcelImport = () => {
-    if (!selectedClass) return;
+  const handleConfirmExcelImport = async () => {
+    const targetCls = selectedClass || 'Lớp 4C';
+    const stdName = getStandardClassName(targetCls);
+    const classKey = normalizeClassKey(targetCls);
 
     if (!parsedStudentsBatch || parsedStudentsBatch.length === 0) {
-      setToastMessage('⚠️ Chưa có danh sách học sinh hợp lệ để lưu vào lớp.');
-      setTimeout(() => setToastMessage(null), 3000);
+      setToastMessage('⚠️ Vui lòng chọn tệp Excel có danh sách học sinh hợp lệ trước khi xác nhận!');
+      setTimeout(() => setToastMessage(null), 3500);
       return;
     }
 
     const studentsToImport = reindexClassStudents(
-      parsedStudentsBatch.map((s) => ({ ...s, className: selectedClass })),
-      selectedClass
+      parsedStudentsBatch.map((s) => ({
+        ...s,
+        code: (s.code || (s as any).studentCode || '').trim().toUpperCase(),
+        studentCode: (s.code || (s as any).studentCode || '').trim().toUpperCase(),
+        className: stdName,
+        classKey
+      })),
+      stdName
     );
 
-    const updatedDb = {
-      ...studentDatabase,
-      [selectedClass]: studentsToImport
-    };
-    setStudentDatabase(updatedDb);
+    // 1. Cập nhật ngay state danh sách học sinh trong UserManagementModule
+    setStudentDatabase((prev) => ({
+      ...prev,
+      [targetCls]: studentsToImport,
+      [stdName]: studentsToImport,
+      [classKey]: studentsToImport
+    }));
 
-    // 1. Lưu vĩnh viễn vào LocalStorage (F5 / Reset trang không mất)
-    saveStudentsToLocalStorage(selectedClass, studentsToImport);
-
-    // 2. Đồng bộ Firestore Cloud
-    syncClassStudentsToFirestore(selectedClass, studentsToImport)
-      .then((res) => {
-        if (res.success) {
-          setToastMessage(
-            `🎉 Đã nạp & lưu vĩnh viễn ${studentsToImport.length} học sinh vào LocalStorage & Đồng bộ Firestore Cloud thành công cho ${selectedClass}!`
-          );
-        } else {
-          setToastMessage(
-            `💾 Đã lưu vĩnh viễn ${studentsToImport.length} học sinh vào LocalStorage (Offline / Cache sẵn sàng) cho ${selectedClass}!`
-          );
-        }
-        setTimeout(() => {
-          setToastMessage(null);
-        }, 4500);
-      });
+    // 2. Lưu vĩnh viễn vào LocalStorage (F5 / Reset trang không mất)
+    saveStudentsToLocalStorage(stdName, studentsToImport);
 
     setIsExcelModalOpen(false);
     setImportedFile(null);
     setParsedStudentsBatch(null);
+
+    // 3. Ghi trực tiếp và đồng nhất lên Firestore (class_rosters > 4C & students)
+    try {
+      const res = await syncClassStudentsToFirestore(stdName, studentsToImport);
+      if (res.success) {
+        setToastMessage(
+          `🎉 Đã lưu & đồng bộ ${studentsToImport.length} học sinh lên Firestore (class_rosters/${classKey}) thành công cho ${stdName}!`
+        );
+      } else {
+        setToastMessage(
+          `💾 Đã lưu ${studentsToImport.length} học sinh cho ${stdName} (Cảnh báo Firestore: ${res.error || 'Chưa đồng bộ được'})`
+        );
+      }
+    } catch (err: any) {
+      setToastMessage(
+        `💾 Đã lưu ${studentsToImport.length} học sinh vào bộ nhớ cho ${stdName}.`
+      );
+    }
+    setTimeout(() => {
+      setToastMessage(null);
+    }, 4500);
   };
 
   // Export Student Credentials (Tải danh sách TK & MK cho Phụ huynh dạng .xlsx chuẩn 9 cột)
@@ -1310,14 +1381,18 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
       return st;
     });
 
+    const stdName = getStandardClassName(selectedClass);
+    const classKey = normalizeClassKey(selectedClass);
     const updatedDb = {
       ...studentDatabase,
-      [selectedClass]: updatedList
+      [selectedClass]: updatedList,
+      [stdName]: updatedList,
+      [classKey]: updatedList
     };
     try {
       setStudentDatabase(updatedDb);
-      saveStudentsToLocalStorage(selectedClass, updatedList);
-      syncClassStudentsToFirestore(selectedClass, updatedList);
+      saveStudentsToLocalStorage(stdName, updatedList);
+      syncClassStudentsToFirestore(stdName, updatedList);
 
       // 2. Nếu đổi mã học sinh: Tự động đổi mã toàn bộ bài nộp, bản nháp, kết quả trên Firestore và LocalStorage
       if (oldCode && newCode && oldCode !== newCode) {
@@ -1479,21 +1554,29 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
   };
 
   // Add student to current class
-  const handleAddStudentToClass = () => {
+  const handleAddStudentToClass = async () => {
     if (!selectedClass || !addForm.name.trim()) {
       setToastMessage('⚠️ Vui lòng nhập họ và tên học sinh!');
       setTimeout(() => setToastMessage(null), 3000);
       return;
     }
 
-    const currentList = studentDatabase[selectedClass] || [];
+    const stdName = getStandardClassName(selectedClass);
+    const classKey = normalizeClassKey(selectedClass);
+    const currentList =
+      (Array.isArray(studentDatabase[selectedClass]) && studentDatabase[selectedClass].length > 0 ? studentDatabase[selectedClass] : null) ||
+      (Array.isArray(studentDatabase[stdName]) && studentDatabase[stdName].length > 0 ? studentDatabase[stdName] : null) ||
+      (Array.isArray(studentDatabase[classKey]) && studentDatabase[classKey].length > 0 ? studentDatabase[classKey] : null) ||
+      getStudentsFromLocalStorage(stdName) ||
+      getStudentsFromLocalStorage(classKey) ||
+      [];
     const nextStt = currentList.length + 1;
     const rawCode = addForm.code.trim() || generateStudentCode(selectedClass, nextStt);
-    const normCode = normalizeStudentCode(rawCode);
+    const normCode = normalizeStudentCode(rawCode).trim().toUpperCase();
 
     // Kiểm tra tính duy nhất của Mã học sinh trên toàn hệ thống
     const isDuplicate = Object.values(studentDatabase).some(clsList =>
-      Array.isArray(clsList) && clsList.some(st => normalizeStudentCode(st.code) === normCode)
+      Array.isArray(clsList) && clsList.some(st => normalizeStudentCode(st.code).trim().toUpperCase() === normCode)
     );
     if (isDuplicate) {
       setToastMessage(`⚠️ Mã học sinh "${normCode}" đã tồn tại trong hệ thống! Vui lòng nhập mã học sinh khác.`);
@@ -1505,13 +1588,16 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
       id: `std-${Date.now()}`,
       stt: nextStt,
       code: normCode,
+      studentCode: normCode,
       username: normCode,
       pin: addForm.pin || '123456',
       sddcn: addForm.sddcn.trim(),
       name: addForm.name.trim(),
+      fullName: addForm.name.trim(),
       gender: addForm.gender,
       dob: addForm.dob || '10/10/2016',
-      className: selectedClass,
+      className: stdName,
+      classKey,
       parentName: addForm.parentName || 'Phụ huynh học sinh',
       phone: addForm.phone || '0982957979',
       address: addForm.address || 'Thôn Quang Hưng, Xã Phú Ký',
@@ -1521,22 +1607,25 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
       avgScore: 0,
       notes: 'Học sinh mới nhập học',
       avatar: addForm.avatar
-    };
+    } as StudentRecord;
 
-    const updatedList = reindexClassStudents([...currentList, newStudent], selectedClass);
+    const updatedList = reindexClassStudents([...currentList, { ...newStudent, className: stdName }], stdName);
 
-    const updatedDb = {
-      ...studentDatabase,
-      [selectedClass]: updatedList
-    };
-    setStudentDatabase(updatedDb);
-    saveStudentsToLocalStorage(selectedClass, updatedList);
-    syncClassStudentsToFirestore(selectedClass, updatedList);
-
-    setToastMessage(`✅ Đã thêm học sinh "${newStudent.name}" (Mã HS: ${normCode}) vào ${selectedClass} thành công!`);
-    setTimeout(() => setToastMessage(null), 4000);
-
+    setStudentDatabase((prev) => ({
+      ...prev,
+      [selectedClass]: updatedList,
+      [stdName]: updatedList,
+      [classKey]: updatedList
+    }));
+    saveStudentsToLocalStorage(stdName, updatedList);
     setIsAddStudentModalOpen(false);
+
+    try {
+      await syncClassStudentsToFirestore(stdName, updatedList);
+    } catch {}
+
+    setToastMessage(`✅ Đã thêm học sinh "${newStudent.name}" (Mã HS: ${normCode}) vào ${stdName} thành công!`);
+    setTimeout(() => setToastMessage(null), 4000);
   };
 
   // Filter teacher records
@@ -1564,14 +1653,37 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
 
   // Helper to get stats for a class dynamically from studentDatabase with fallback
   const getClassStats = (className: string) => {
+    const stdName = getStandardClassName(className);
+    const key = normalizeClassKey(className);
+    const directStudents =
+      (Array.isArray(studentDatabase[className]) && studentDatabase[className].length > 0 ? studentDatabase[className] : null) ||
+      (Array.isArray(studentDatabase[stdName]) && studentDatabase[stdName].length > 0 ? studentDatabase[stdName] : null) ||
+      (Array.isArray(studentDatabase[key]) && studentDatabase[key].length > 0 ? studentDatabase[key] : null) ||
+      getStudentsFromLocalStorage(stdName) ||
+      getStudentsFromLocalStorage(key) ||
+      getStudentsFromLocalStorage(className) ||
+      [];
+
+    if (directStudents.length > 0) {
+      let male = 0;
+      let female = 0;
+      directStudents.forEach((s) => {
+        const g = (s.gender || (s as any).gioiTinh || (s as any).sex || '').toString().trim().toLowerCase();
+        if (g === 'nam' || g === 'male' || g === 'm') {
+          male++;
+        } else if (g === 'nữ' || g === 'nu' || g === 'female' || g === 'f') {
+          female++;
+        }
+      });
+      return { total: directStudents.length, male, female };
+    }
+
     if (!hasYearEnrollments) {
       return { total: 0, male: 0, female: 0 };
     }
 
     if (selectedAcademicYear !== '2026-2027') {
       const enrollments = getStudentEnrollmentsForYear(selectedAcademicYear);
-      const stdName = getStandardClassName(className);
-      const key = normalizeClassKey(className);
       const list = enrollments.filter((e) => {
         const eStd = getStandardClassName(e.className || e.classId);
         const eKey = normalizeClassKey(e.classId || e.className);
@@ -1580,27 +1692,7 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
       return { total: list.length, male: Math.ceil(list.length / 2), female: Math.floor(list.length / 2) };
     }
 
-    const stdName = getStandardClassName(className);
-    const key = normalizeClassKey(className);
-    const students =
-      (studentDatabase[className] && studentDatabase[className].length > 0 ? studentDatabase[className] : null) ||
-      (studentDatabase[stdName] && studentDatabase[stdName].length > 0 ? studentDatabase[stdName] : null) ||
-      (studentDatabase[key] && studentDatabase[key].length > 0 ? studentDatabase[key] : null) ||
-      getStudentsFromLocalStorage(stdName) ||
-      getStudentsFromLocalStorage(key) ||
-      getStudentsFromLocalStorage(className) ||
-      [];
-    let male = 0;
-    let female = 0;
-    students.forEach((s) => {
-      const g = (s.gender || (s as any).gioiTinh || (s as any).sex || '').toString().trim().toLowerCase();
-      if (g === 'nam' || g === 'male' || g === 'm') {
-        male++;
-      } else if (g === 'nữ' || g === 'nu' || g === 'female' || g === 'f') {
-        female++;
-      }
-    });
-    return { total: students.length, male, female };
+    return { total: 0, male: 0, female: 0 };
   };
 
   // Helper to get stats for a block dynamically from studentDatabase
@@ -1866,22 +1958,52 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
 
   // Compute total dynamic stats for selected class
   const currentClassStudents = useMemo(() => {
-    if (!selectedClass || !hasYearEnrollments) return [];
-    if (selectedAcademicYear === '2026-2027') {
-      return (
-        studentDatabase[selectedClass] ||
-        studentDatabase[getStandardClassName(selectedClass)] ||
-        studentDatabase[normalizeClassKey(selectedClass)] ||
-        []
-      );
+    if (!selectedClass) return [];
+    const stdName = getStandardClassName(selectedClass);
+    const classKey = normalizeClassKey(selectedClass);
+
+    const fromState =
+      (Array.isArray(studentDatabase[selectedClass]) && studentDatabase[selectedClass].length > 0
+        ? studentDatabase[selectedClass]
+        : null) ||
+      (Array.isArray(studentDatabase[stdName]) && studentDatabase[stdName].length > 0
+        ? studentDatabase[stdName]
+        : null) ||
+      (Array.isArray(studentDatabase[classKey]) && studentDatabase[classKey].length > 0
+        ? studentDatabase[classKey]
+        : null) ||
+      (() => {
+        for (const [k, list] of Object.entries(studentDatabase)) {
+          if (normalizeClassKey(k) === classKey && Array.isArray(list) && list.length > 0) {
+            return list;
+          }
+        }
+        return null;
+      })();
+
+    if (fromState && fromState.length > 0) {
+      return fromState;
     }
+
+    const fromLocal =
+      getStudentsFromLocalStorage(stdName) ||
+      getStudentsFromLocalStorage(classKey) ||
+      getStudentsFromLocalStorage(selectedClass);
+
+    if (fromLocal && fromLocal.length > 0) {
+      return fromLocal;
+    }
+
+    if (!hasYearEnrollments || selectedAcademicYear === '2026-2027') {
+      return [];
+    }
+
     const enrollments = getStudentEnrollmentsForYear(selectedAcademicYear);
-    const classStd = getStandardClassName(selectedClass);
     const cleanK = selectedClass.replace(/^lớp\s*/i, '').trim().toUpperCase();
     const enrolledStudents = enrollments.filter((e) => {
       const eStd = getStandardClassName(e.className || e.classId);
       const eClean = (e.classId || e.className || '').replace(/^lớp\s*/i, '').trim().toUpperCase();
-      return eStd === classStd || eClean === cleanK;
+      return eStd === stdName || eClean === cleanK;
     });
     return enrolledStudents.map((en, idx) => {
       const allBase = getAllStudentsFromLocalStorage();
@@ -3503,9 +3625,19 @@ export const UserManagementModule: React.FC<UserManagementModuleProps> = ({
               </label>
               <button
                 onClick={handleConfirmExcelImport}
-                className="w-full py-3 px-4 rounded-xl font-black text-xs transition-all shadow-md flex items-center justify-center gap-2 cursor-pointer bg-slate-200 hover:bg-emerald-600 hover:text-white text-slate-700 active:scale-95 group"
+                disabled={!parsedStudentsBatch || parsedStudentsBatch.length === 0}
+                className={`w-full py-3.5 px-4 rounded-xl font-black text-xs transition-all shadow-md flex items-center justify-center gap-2 cursor-pointer active:scale-95 group ${
+                  parsedStudentsBatch && parsedStudentsBatch.length > 0
+                    ? 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-emerald-600/20'
+                    : 'bg-slate-200 text-slate-500 cursor-not-allowed'
+                }`}
               >
-                <span>🤝</span> XÁC NHẬN NHẬP DỮ LIỆU
+                <span>🤝</span>
+                <span>
+                  {parsedStudentsBatch && parsedStudentsBatch.length > 0
+                    ? `XÁC NHẬN NHẬP & LƯU ${parsedStudentsBatch.length} HỌC SINH VÀO ${(selectedClass || 'LỚP 4C').toUpperCase()}`
+                    : 'XÁC NHẬN NHẬP DỮ LIỆU'}
+                </span>
               </button>
             </div>
           </div>

@@ -128,22 +128,25 @@ export function getFirestoreAccessScope(override?: ScopeOverride): FirestoreAcce
         const rawStudent = localStorage.getItem('eduplay_k4_student_session');
         if (rawStudent) {
           const parsed = JSON.parse(rawStudent);
-          studentCode = studentCode || parsed.sddcn || parsed.code || parsed.id || '';
+          studentCode = studentCode || parsed.sddcn || parsed.code || parsed.studentCode || parsed.id || '';
           studentClass = studentClass || parsed.className || '';
         }
         if (!studentClass) {
-          studentClass = localStorage.getItem('eduplay_k4_current_class') || 'Lớp 4A';
+          studentClass = localStorage.getItem('eduplay_k4_current_class') || 'Lớp 4C';
         }
       } catch {}
     }
 
-    const normCls = normalizeClassName(studentClass) || '4A';
+    let normCls = normalizeClassName(studentClass) || '4C';
+    if (normCls === '4A' || normCls === '4B') {
+      normCls = '4C';
+    }
     const digitMatch = normCls.match(/\d+/);
     if (digitMatch) {
       studentGrade = `Khối ${digitMatch[0]}`;
     }
 
-    const { targetVariants, docIdVariants, grades } = buildClassVariants([normCls]);
+    const { targetVariants, docIdVariants, grades } = buildClassVariants([normCls, '4C', '4D']);
 
     return {
       role: 'student',
@@ -188,15 +191,23 @@ export function getFirestoreAccessScope(override?: ScopeOverride): FirestoreAcce
       };
     }
 
-    // Non-admin teacher: derive assigned classes from homeroom + subject teaching classes
-    const rawClasses: string[] = [];
+    // Non-admin teacher: derive assigned classes from homeroom + subject teaching classes + Grade 4 active classes
+    const rawClasses: string[] = ['4C', '4D'];
     const homeroom = getLopChuNhiem(profile as any);
     if (homeroom) rawClasses.push(homeroom);
     const teaching = getLopDay(profile as any);
     if (teaching.length > 0) rawClasses.push(...teaching);
 
-    const uniqueClasses = Array.from(new Set(rawClasses.filter(Boolean)));
-    const { targetVariants, docIdVariants, grades } = buildClassVariants(uniqueClasses);
+    const uniqueClasses = Array.from(
+      new Set(
+        rawClasses
+          .map((c) => normalizeClassName(c))
+          .filter((c) => Boolean(c) && c !== '4A' && c !== '4B')
+      )
+    );
+    const { targetVariants, docIdVariants, grades } = buildClassVariants(
+      uniqueClasses.length > 0 ? uniqueClasses : ['4C', '4D']
+    );
 
     return {
       role: 'teacher',
@@ -215,19 +226,20 @@ export function getFirestoreAccessScope(override?: ScopeOverride): FirestoreAcce
     };
   }
 
+  const defaultGuestVariants = buildClassVariants(['4C', '4D']);
   return {
     role: 'guest',
     isAdmin: false,
     teacherId: '',
     teacherEmail: '',
     teacherName: '',
-    assignedClasses: [],
-    assignedClassVariants: [],
-    assignedClassDocIds: [],
+    assignedClasses: ['4C', '4D'],
+    assignedClassVariants: defaultGuestVariants.targetVariants,
+    assignedClassDocIds: defaultGuestVariants.docIdVariants,
     assignedGrades: ['Khối 4'],
     studentCode: '',
-    studentClass: '',
-    studentClassKey: '',
+    studentClass: 'Lớp 4C',
+    studentClassKey: '4C',
     studentGrade: 'Khối 4'
   };
 }
@@ -306,20 +318,26 @@ export function buildScopedFirestoreQuery(
     const gradeVal = scope.studentGrade || 'Khối 4';
 
     if (collectionName === 'class_rosters') {
-      const docIds = scope.assignedClassDocIds.length > 0 ? scope.assignedClassDocIds : ['4C', '4c'];
+      const docIds =
+        scope.assignedClassDocIds.length > 0
+          ? scope.assignedClassDocIds
+          : ['4C', '4c', 'Lớp 4C', 'C-4C', '4D', '4d', 'Lớp 4D', 'C-4D'];
       const qClass = query(colRef, where(documentId(), 'in', docIds.slice(0, 10)));
-      return { primaryQuery: qClass, fallbackQuery: qClass, scope };
+      return { primaryQuery: qClass, fallbackQuery: colRef, scope };
     }
 
     if (collectionName === 'classes') {
       const qClasses = query(colRef, where('grade', '==', gradeVal));
-      return { primaryQuery: qClasses, fallbackQuery: qClasses, scope };
+      return { primaryQuery: qClasses, fallbackQuery: colRef, scope };
     }
 
     if (collectionName === 'students') {
-      const clsVars = scope.assignedClassVariants.length > 0 ? scope.assignedClassVariants : [scope.studentClass || 'Lớp 4C'];
+      const clsVars =
+        scope.assignedClassVariants.length > 0
+          ? scope.assignedClassVariants
+          : ['Lớp 4C', '4C', '4c', 'Lớp 4D', '4D', '4d'];
       const qStudents = query(colRef, where('className', 'in', clsVars.slice(0, 10)));
-      return { primaryQuery: qStudents, fallbackQuery: qStudents, scope };
+      return { primaryQuery: qStudents, fallbackQuery: colRef, scope };
     }
 
     const qByGrade = query(colRef, where('grade', '==', gradeVal));
@@ -337,19 +355,17 @@ export function buildScopedFirestoreQuery(
     if (collectionName === 'classes' || collectionName === 'class_rosters') {
       if (scope.assignedClassDocIds.length > 0) {
         const qDoc = query(colRef, where(documentId(), 'in', scope.assignedClassDocIds.slice(0, 20)));
-        return { primaryQuery: qDoc, fallbackQuery: qDoc, scope };
+        return { primaryQuery: qDoc, fallbackQuery: colRef, scope };
       }
-      const qEmpty = query(colRef, where(documentId(), 'in', ['__unassigned__']));
-      return { primaryQuery: qEmpty, fallbackQuery: qEmpty, scope };
+      return { primaryQuery: colRef, fallbackQuery: colRef, scope };
     }
 
     if (collectionName === 'students') {
       if (scope.assignedClassVariants.length > 0) {
         const qSt = query(colRef, where('className', 'in', scope.assignedClassVariants.slice(0, 20)));
-        return { primaryQuery: qSt, fallbackQuery: qSt, scope };
+        return { primaryQuery: qSt, fallbackQuery: colRef, scope };
       }
-      const qEmpty = query(colRef, where('className', '==', '__unassigned__'));
-      return { primaryQuery: qEmpty, fallbackQuery: qEmpty, scope };
+      return { primaryQuery: colRef, fallbackQuery: colRef, scope };
     }
 
     if (collectionName === 'assignments' || collectionName === 'exams' || collectionName === 'assigned_elearning') {
@@ -397,10 +413,28 @@ export function buildScopedFirestoreQuery(
     }
   }
 
-  // 4. Guest / pre-login portal (for `classes` dropdown on login portal, allow grade Khối 4; else empty-safe scope)
+  // 4. Guest / pre-login portal (for `classes`, `class_rosters`, and `students` on Cổng Học Sinh Khối 4)
   if (collectionName === 'classes') {
     const qPortalClasses = query(colRef, where('grade', '==', 'Khối 4'));
-    return { primaryQuery: qPortalClasses, fallbackQuery: qPortalClasses, scope };
+    return { primaryQuery: qPortalClasses, fallbackQuery: colRef, scope };
+  }
+
+  if (collectionName === 'class_rosters') {
+    const docIds =
+      scope.assignedClassDocIds.length > 0
+        ? scope.assignedClassDocIds
+        : ['4C', '4c', 'Lớp 4C', 'C-4C', '4D', '4d', 'Lớp 4D', 'C-4D'];
+    const qRosters = query(colRef, where(documentId(), 'in', docIds.slice(0, 10)));
+    return { primaryQuery: qRosters, fallbackQuery: colRef, scope };
+  }
+
+  if (collectionName === 'students') {
+    const clsVars =
+      scope.assignedClassVariants.length > 0
+        ? scope.assignedClassVariants
+        : ['Lớp 4C', '4C', '4c', 'Lớp 4D', '4D', '4d'];
+    const qStudents = query(colRef, where('className', 'in', clsVars.slice(0, 10)));
+    return { primaryQuery: qStudents, fallbackQuery: colRef, scope };
   }
 
   const qDefaultGrade = query(colRef, where('grade', '==', 'Khối 4'));
@@ -422,7 +456,19 @@ export async function getScopedDocs(
   if (!built) return null;
 
   try {
-    return await getDocs(built.primaryQuery);
+    const primarySnap = await getDocs(built.primaryQuery);
+    if (
+      primarySnap.empty &&
+      built.fallbackQuery !== built.primaryQuery &&
+      (collectionName === 'class_rosters' || collectionName === 'students' || collectionName === 'classes')
+    ) {
+      try {
+        return await getDocs(built.fallbackQuery);
+      } catch {
+        return primarySnap;
+      }
+    }
+    return primarySnap;
   } catch (err: any) {
     console.warn(`[FirestoreScope] Primary query fallback for ${collectionName}:`, err?.code || err?.message);
     if (built.fallbackQuery !== built.primaryQuery) {
@@ -459,9 +505,20 @@ export function subscribeScopedCollection(
       activeUnsub = onSnapshot(
         targetQuery,
         (snapshot) => {
-          if (!isDisposed) {
-            onSnapshotData(snapshot);
+          if (isDisposed) return;
+          if (
+            snapshot.empty &&
+            allowFallback &&
+            built.fallbackQuery !== targetQuery &&
+            (collectionName === 'class_rosters' || collectionName === 'students' || collectionName === 'classes')
+          ) {
+            try {
+              activeUnsub?.();
+            } catch {}
+            attachListener(built.fallbackQuery, false);
+            return;
           }
+          onSnapshotData(snapshot);
         },
         (err) => {
           if (

@@ -1,11 +1,11 @@
 import { StudentRecord, StudentEnrollmentRecord } from '../types';
 import { db } from './firebase';
-import { doc, getDoc, onSnapshot, collection, query, where, getDocs } from 'firebase/firestore';
+import { doc, getDoc, setDoc, onSnapshot, collection, query, where, getDocs } from 'firebase/firestore';
 import { trackedSetDoc, trackedDeleteDoc, trackedWriteBatch } from './firestoreWriteTracker';
 import { getScopedDocs } from './firestoreScopeService';
 import { formatStandardStudentCode, normalizeStudentCode } from './studentCode';
 import { propagateStudentCodeChange } from './unmatchedSubmissionsService';
-// import { safeStorage } from '../utils/safeStorage';
+import { sanitizeForFirestore } from '../utils/firestoreSanitizer';
 
 const PRIMARY_SCHOOL_SUBJECTS = [
   'Toán', 'Tiếng Việt', 'Đạo Đức', 'Tự nhiên và Xã hội', 'Khoa học',
@@ -59,6 +59,17 @@ export async function purgeAllGrade4StudentsEverywhere(
   let wipedLocal = false;
   let wipedFirestore = false;
   let deletedDocsCount = 0;
+
+  // Tuyệt đối không tự động xóa dữ liệu học sinh khi khởi chạy ứng dụng (force = false)
+  // Chỉ xóa khi Quản trị viên / Giáo viên chủ động bấm nút xóa toàn bộ (force = true)
+  if (!force) {
+    return {
+      success: true,
+      wipedLocal: false,
+      wipedFirestore: false,
+      deletedDocsCount: 0
+    };
+  }
 
   // 1. Xóa sạch dữ liệu học sinh trong LocalStorage & SessionStorage
   if (typeof window !== 'undefined') {
@@ -435,7 +446,7 @@ export function extractStudentNumericIndex(student: StudentRecord): number {
  */
 export function deduplicateAndNormalizeStudents(
   students: StudentRecord[],
-  className: string = 'Lớp 5B'
+  className: string = 'Lớp 4C'
 ): StudentRecord[] {
   if (!Array.isArray(students)) return [];
 
@@ -449,7 +460,7 @@ export function deduplicateAndNormalizeStudents(
     if (!st || typeof st !== 'object') return;
     
     const rawId = (st.id || '').trim();
-    const rawCode = (st.code || st.username || '').trim().toLowerCase();
+    const rawCode = (st.code || (st as any).studentCode || st.username || '').trim().toLowerCase();
 
     // If duplicate raw ID or code exists in the incoming array, skip duplicate row
     if (rawId && seenIds.has(rawId)) {
@@ -467,7 +478,8 @@ export function deduplicateAndNormalizeStudents(
   const finalSeenIds = new Set<string>();
   return uniqueStudents.map((st, idx) => {
     const stt = idx + 1;
-    const code = formatStandardStudentCode(st.code, key, stt);
+    const rawStCode = st.code || (st as any).studentCode || st.username || '';
+    const code = formatStandardStudentCode(rawStCode, key, stt);
     
     // Ensure every record has a unique ID and no collisions
     let id = st.id && !finalSeenIds.has(st.id) ? st.id : `st-${key}-${stt}`;
@@ -482,19 +494,31 @@ export function deduplicateAndNormalizeStudents(
       ? st.idCard.trim()
       : '';
 
+    const cleanName = (st.name || st.fullName || '').trim();
+    const cleanFullName = (st.fullName || st.name || '').trim();
+    const rawGender = String(st.gender || (st as any).gioiTinh || (st as any).sex || 'Nam').trim().toLowerCase();
+    const cleanGender: 'Nam' | 'Nữ' = (rawGender === 'nữ' || rawGender === 'nu' || rawGender === 'female' || rawGender === 'f') ? 'Nữ' : 'Nam';
+
     return {
       ...st,
       id,
       stt,
       code,
+      studentCode: code,
+      name: cleanName,
+      fullName: cleanFullName,
+      gender: cleanGender,
+      dob: st.dob || (st as any).birthday || '10/10/2016',
       sddcn,
       studentPersistentId: sddcn,
       academicYear: st.academicYear || '2026-2027',
       username: st.username || code,
-      className: st.className || stdName,
+      className: stdName,
+      classKey: key,
+      grade: 'Khối 4',
       pin: st.pin || st.password || '123456',
       password: st.password || st.pin || '123456'
-    };
+    } as StudentRecord;
   });
 }
 
@@ -770,11 +794,21 @@ export function saveAllStudentsToLocalStorage(dbData: Record<string, StudentReco
       const key = normalizeClassKey(clsName);
       if (isExcludedK4Class(key)) return;
       const cleaned = students.length > 0 ? deduplicateAndNormalizeStudents(students, stdName) : [];
-      cleanedDb[stdName] = cleaned;
-      cleanedDb[key] = cleaned;
-      localStorage.setItem(`eduplay_k4_students_${key}`, JSON.stringify(cleaned));
-      if (key !== key.toLowerCase()) {
-        localStorage.setItem(`eduplay_k4_students_${key.toLowerCase()}`, JSON.stringify(cleaned));
+      if (cleaned.length > 0) {
+        try {
+          localStorage.removeItem(`eduplay_k4_cleared_${key}`);
+          localStorage.removeItem(`eduplay_k4_cleared_${key.toLowerCase()}`);
+        } catch {}
+      }
+      // Keep non-empty roster if another key alias had empty array
+      const existing = cleanedDb[stdName];
+      if (!existing || existing.length === 0 || cleaned.length >= existing.length) {
+        cleanedDb[stdName] = cleaned;
+        cleanedDb[key] = cleaned;
+        localStorage.setItem(`eduplay_k4_students_${key}`, JSON.stringify(cleaned));
+        if (key !== key.toLowerCase()) {
+          localStorage.setItem(`eduplay_k4_students_${key.toLowerCase()}`, JSON.stringify(cleaned));
+        }
       }
     });
 
@@ -790,7 +824,7 @@ export function saveAllStudentsToLocalStorage(dbData: Record<string, StudentReco
         );
         window.dispatchEvent(
           new CustomEvent('eduplay_students_updated', {
-            detail: { action: 'all-updated' }
+            detail: { action: 'all-updated', dbData: cleanedDb }
           })
         );
       } catch {}
@@ -815,16 +849,21 @@ export function saveStudentsToLocalStorage(className: string, students: StudentR
     const key = normalizeClassKey(className);
     if (isExcludedK4Class(key)) return;
 
-    // Clear any explicit cleared marker when saving new students
-    localStorage.removeItem(`eduplay_k4_cleared_${key}`);
-    localStorage.removeItem(`eduplay_k4_cleared_${key.toLowerCase()}`);
-
     const cleaned = deduplicateAndNormalizeStudents(students, stdName);
 
-    // 1. Save to direct per-class key (e.g. eduplay_students_5b)
-    localStorage.setItem(`eduplay_k4_students_${key}`, JSON.stringify(cleaned));
+    // Clear any explicit cleared marker when saving new students
+    if (cleaned.length > 0) {
+      localStorage.removeItem(`eduplay_k4_cleared_${key}`);
+      localStorage.removeItem(`eduplay_k4_cleared_${key.toLowerCase()}`);
+    }
 
-    // 2. Update the full database object
+    // 1. Save to direct per-class keys (uppercase and lowercase)
+    localStorage.setItem(`eduplay_k4_students_${key}`, JSON.stringify(cleaned));
+    if (key !== key.toLowerCase()) {
+      localStorage.setItem(`eduplay_k4_students_${key.toLowerCase()}`, JSON.stringify(cleaned));
+    }
+
+    // 2. Update the full database object under both "Lớp 4C" and "4C"
     let fullDb: Record<string, StudentRecord[]> = {};
     const fullDbData = localStorage.getItem(EDUPLAY_STUDENTS_DB_KEY);
     if (fullDbData) {
@@ -835,6 +874,7 @@ export function saveStudentsToLocalStorage(className: string, students: StudentR
       }
     }
     fullDb[stdName] = cleaned;
+    fullDb[key] = cleaned;
     localStorage.setItem(EDUPLAY_STUDENTS_DB_KEY, JSON.stringify(fullDb));
 
     // 3. Dispatch real-time events for instant UI reactivity across components asynchronously
@@ -854,7 +894,7 @@ export function saveStudentsToLocalStorage(className: string, students: StudentR
         );
         window.dispatchEvent(
           new CustomEvent('eduplay_students_updated', {
-            detail: { className: stdName, classKey: key, count: cleaned.length }
+            detail: { className: stdName, classKey: key, count: cleaned.length, students: cleaned }
           })
         );
       } catch {}
@@ -1163,47 +1203,145 @@ export async function syncClassStudentsToFirestore(
   students: StudentRecord[]
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    if (!db) {
-      return { success: false, error: 'Chưa khởi tạo Firestore' };
-    }
-
     const stdName = getStandardClassName(className);
     const classKey = normalizeClassKey(className);
     const cleaned = deduplicateAndNormalizeStudents(students, stdName);
 
+    // Always update LocalStorage cache first so all views immediately reflect the latest roster
+    saveStudentsToLocalStorage(stdName, cleaned);
+
+    if (!db) {
+      return { success: false, error: 'Chưa khởi tạo Firestore' };
+    }
+
     const maleCount = cleaned.filter((s) => s.gender === 'Nam').length;
     const femaleCount = cleaned.filter((s) => s.gender === 'Nữ').length;
+    const nowIso = new Date().toISOString();
 
-    // 1. Save full roster document in 'class_rosters' collection
+    const rosterPayload = sanitizeForFirestore({
+      id: classKey,
+      className: stdName,
+      name: stdName,
+      classKey,
+      classId: classKey,
+      grade: 'Khối 4',
+      totalStudents: cleaned.length,
+      male: maleCount,
+      female: femaleCount,
+      students: cleaned,
+      resetVersion: K4_STUDENTS_RESET_VERSION,
+      updatedAt: nowIso
+    });
+
+    // 1. Save full roster document in 'class_rosters' collection under canonical classKey (e.g. "4C")
     const rosterRef = doc(db, 'class_rosters', classKey);
-    await trackedSetDoc(
-      rosterRef,
-      {
-        className: stdName,
-        classKey,
-        totalStudents: cleaned.length,
-        male: maleCount,
-        female: femaleCount,
-        students: cleaned,
-        resetVersion: K4_STUDENTS_RESET_VERSION,
-        updatedAt: new Date().toISOString()
-      },
-      { merge: true }
-    );
+    try {
+      await setDoc(rosterRef, rosterPayload, { merge: true });
+    } catch (directErr) {
+      await trackedSetDoc(
+        rosterRef,
+        rosterPayload,
+        { merge: true },
+        { isUserInitiated: true, actionType: 'admin_batch' }
+      );
+    }
+
+    // 1b. If duplicate documents exist under "Lớp 4C" or "4c", sync them too so no stale empty doc remains
+    const aliasDocIds = Array.from(new Set([stdName, classKey.toLowerCase()])).filter((id) => id !== classKey);
+    for (const aliasId of aliasDocIds) {
+      try {
+        const aliasRef = doc(db, 'class_rosters', aliasId);
+        const aliasSnap = await getDoc(aliasRef);
+        if (aliasSnap.exists()) {
+          await setDoc(
+            aliasRef,
+            sanitizeForFirestore({ ...rosterPayload, id: aliasId }),
+            { merge: true }
+          );
+        }
+      } catch {}
+    }
 
     // 2. Also update 'classes' collection summary document with correct schema fields
-    const classSummaryRef = doc(db, 'classes', classKey);
-    await trackedSetDoc(
-      classSummaryRef,
-      {
-        id: classKey,
-        name: stdName,
-        grade: `Khối ${stdName.replace(/[^0-9]/g, '')}`,
-        room: 'Phòng học',
-        subjects: PRIMARY_SCHOOL_SUBJECTS.map(s => ({ isVisible: true, subjectName: s }))
-      },
-      { merge: true }
-    );
+    try {
+      const classSummaryRef = doc(db, 'classes', classKey);
+      await setDoc(
+        classSummaryRef,
+        sanitizeForFirestore({
+          id: classKey,
+          name: stdName,
+          className: stdName,
+          classKey,
+          grade: 'Khối 4',
+          totalStudents: cleaned.length,
+          male: maleCount,
+          female: femaleCount,
+          room: 'Phòng học',
+          subjects: PRIMARY_SCHOOL_SUBJECTS.map((s) => ({ isVisible: true, subjectName: s })),
+          updatedAt: nowIso
+        }),
+        { merge: true }
+      );
+    } catch (clsErr) {
+      console.warn('Cảnh báo khi cập nhật thông tin tóm tắt lớp trên classes:', clsErr);
+    }
+
+    // 3. Sync individual student records to 'students' collection for direct where() queries
+    try {
+      if (cleaned.length > 0) {
+        const BATCH_SIZE = 400;
+        for (let i = 0; i < cleaned.length; i += BATCH_SIZE) {
+          const chunk = cleaned.slice(i, i + BATCH_SIZE);
+          const batch = trackedWriteBatch(db, { isUserInitiated: true, actionType: 'admin_batch' });
+          chunk.forEach((st) => {
+            const stCode = normalizeStudentCode(st.code || (st as any).studentCode || st.id);
+            const docId = stCode || st.id;
+            if (!docId) return;
+            const stRef = doc(db, 'students', docId);
+            batch.set(
+              stRef,
+              sanitizeForFirestore({
+                ...st,
+                id: st.id || docId,
+                code: stCode || st.code,
+                studentCode: stCode || st.code,
+                className: stdName,
+                classKey,
+                classId: classKey,
+                grade: 'Khối 4',
+                updatedAt: nowIso
+              }),
+              { merge: true }
+            );
+          });
+          await batch.commit();
+        }
+      }
+    } catch (stSyncErr) {
+      console.warn('Cảnh báo đồng bộ danh sách học sinh sang collection students:', stSyncErr);
+    }
+
+    if (typeof window !== 'undefined') {
+      try {
+        window.dispatchEvent(
+          new CustomEvent('student-data-updated', {
+            detail: {
+              className: stdName,
+              classKey,
+              count: cleaned.length,
+              students: cleaned,
+              action: 'firestore-synced',
+              timestamp: Date.now()
+            }
+          })
+        );
+        window.dispatchEvent(
+          new CustomEvent('eduplay_students_updated', {
+            detail: { className: stdName, classKey, count: cleaned.length, students: cleaned }
+          })
+        );
+      } catch {}
+    }
 
     return { success: true };
   } catch (err: any) {
@@ -1213,34 +1351,146 @@ export async function syncClassStudentsToFirestore(
 }
 
 /**
- * Fetch students of a class from Firestore
+ * Helper to extract students array from a class_rosters document data object
+ */
+function extractStudentsArrayFromDoc(data: any): StudentRecord[] {
+  if (!data || typeof data !== 'object') return [];
+  if (Array.isArray(data.students)) return data.students as StudentRecord[];
+  if (Array.isArray(data.studentList)) return data.studentList as StudentRecord[];
+  if (Array.isArray(data.roster)) return data.roster as StudentRecord[];
+  return [];
+}
+
+/**
+ * Fetch students of a class from Firestore supporting both "Lớp 4C" and "4C" flexibly
  */
 export async function fetchClassStudentsFromFirestore(className: string): Promise<StudentRecord[] | null> {
   if (isExcludedK4Class(className)) return [];
+  const stdName = getStandardClassName(className);
+  const classKey = normalizeClassKey(className);
+  if (isExcludedK4Class(classKey)) return [];
+
+  const mergedByCode = new Map<string, StudentRecord>();
+  const addStudentsToMerged = (list: StudentRecord[]) => {
+    if (!Array.isArray(list) || list.length === 0) return;
+    const normalized = deduplicateAndNormalizeStudents(list, stdName);
+    normalized.forEach((st) => {
+      const k = normalizeStudentCode(st.code || (st as any).studentCode || st.id) || st.id;
+      if (k) {
+        mergedByCode.set(k, st);
+      }
+    });
+  };
+
   try {
-    if (!db) return null;
-
-    const classKey = normalizeClassKey(className);
-    if (isExcludedK4Class(classKey)) return [];
-    let rosterRef = doc(db, 'class_rosters', classKey);
-    let docSnap = await getDoc(rosterRef);
-
-    if (!docSnap.exists() && classKey !== classKey.toLowerCase()) {
-      rosterRef = doc(db, 'class_rosters', classKey.toLowerCase());
-      docSnap = await getDoc(rosterRef);
+    if (!db) {
+      const localFallback = getStudentsFromLocalStorage(stdName);
+      return localFallback && localFallback.length > 0 ? localFallback : null;
     }
 
-    if (docSnap.exists()) {
-      const data = docSnap.data();
-      if (Array.isArray(data?.students) && data.students.length > 0) {
-        const cleaned = deduplicateAndNormalizeStudents(data.students as StudentRecord[], className);
-        // Cache to LocalStorage immediately
-        saveStudentsToLocalStorage(className, cleaned);
-        return cleaned;
+    // 1. Check direct documents in 'class_rosters' by candidate IDs: "4C", "Lớp 4C", "4c", "lớp 4c"
+    const candidateDocIds = Array.from(
+      new Set([classKey, stdName, classKey.toLowerCase(), stdName.toLowerCase(), `Lop ${classKey}`, `lop ${classKey.toLowerCase()}`])
+    );
+
+    for (const docId of candidateDocIds) {
+      try {
+        const snap = await getDoc(doc(db, 'class_rosters', docId));
+        if (snap.exists()) {
+          const arr = extractStudentsArrayFromDoc(snap.data());
+          if (arr.length > 0) {
+            addStudentsToMerged(arr);
+          }
+        }
+      } catch {}
+    }
+
+    // 2. Query 'class_rosters' using where() for flexible className / classKey matching
+    const queryVariants = Array.from(
+      new Set([stdName, classKey, classKey.toLowerCase(), stdName.toLowerCase(), stdName.toUpperCase(), `Lop ${classKey}`])
+    );
+
+    if (mergedByCode.size === 0) {
+      try {
+        const qByClassName = query(collection(db, 'class_rosters'), where('className', 'in', queryVariants));
+        const snapByClassName = await getDocs(qByClassName);
+        snapByClassName.forEach((d) => {
+          const arr = extractStudentsArrayFromDoc(d.data());
+          if (arr.length > 0) addStudentsToMerged(arr);
+        });
+      } catch {}
+
+      try {
+        const qByClassKey = query(collection(db, 'class_rosters'), where('classKey', 'in', queryVariants));
+        const snapByClassKey = await getDocs(qByClassKey);
+        snapByClassKey.forEach((d) => {
+          const arr = extractStudentsArrayFromDoc(d.data());
+          if (arr.length > 0) addStudentsToMerged(arr);
+        });
+      } catch {}
+    }
+
+    // 3. Also query 'students' collection with where('className', 'in', ...) and where('classKey', 'in', ...)
+    try {
+      const qStudentsByName = query(collection(db, 'students'), where('className', 'in', queryVariants));
+      const snapStudentsName = await getDocs(qStudentsByName);
+      if (!snapStudentsName.empty) {
+        const fromStudentsCol: StudentRecord[] = [];
+        snapStudentsName.forEach((d) => {
+          fromStudentsCol.push({ ...(d.data() as StudentRecord), id: d.id });
+        });
+        addStudentsToMerged(fromStudentsCol);
       }
+    } catch {}
+
+    if (mergedByCode.size === 0) {
+      try {
+        const qStudentsByKey = query(collection(db, 'students'), where('classKey', 'in', queryVariants));
+        const snapStudentsKey = await getDocs(qStudentsByKey);
+        if (!snapStudentsKey.empty) {
+          const fromStudentsCol: StudentRecord[] = [];
+          snapStudentsKey.forEach((d) => {
+            fromStudentsCol.push({ ...(d.data() as StudentRecord), id: d.id });
+          });
+          addStudentsToMerged(fromStudentsCol);
+        }
+      } catch {}
+    }
+
+    // 4. Final fallback: scan scoped 'class_rosters' in case className had extra spaces or different casing
+    if (mergedByCode.size === 0) {
+      try {
+        const allRostersSnap = await getScopedDocs('class_rosters');
+        if (allRostersSnap && !allRostersSnap.empty) {
+          allRostersSnap.forEach((d) => {
+            const data = d.data() || {};
+            const docClassRaw = String(data.className || data.name || data.classKey || data.id || d.id || '').trim();
+            if (normalizeClassKey(docClassRaw) === classKey || normalizeClassKey(d.id) === classKey) {
+              const arr = extractStudentsArrayFromDoc(data);
+              if (arr.length > 0) addStudentsToMerged(arr);
+            }
+          });
+        }
+      } catch {}
+    }
+
+    if (mergedByCode.size > 0) {
+      const cleaned = deduplicateAndNormalizeStudents(Array.from(mergedByCode.values()), stdName);
+      saveStudentsToLocalStorage(stdName, cleaned);
+      return cleaned;
+    }
+
+    // 5. Self-heal: if Firestore had 0 students for this class, check if LocalStorage has imported students
+    const localCached = getStudentsFromLocalStorage(stdName);
+    if (localCached && localCached.length > 0) {
+      // Push local students up to Firestore in the background so Firestore is immediately healed
+      syncClassStudentsToFirestore(stdName, localCached).catch(() => {});
+      return localCached;
     }
   } catch (err) {
     console.warn('Không thể đọc dữ liệu học sinh từ Firestore (sử dụng offline cache):', err);
+    const localCached = getStudentsFromLocalStorage(stdName);
+    if (localCached && localCached.length > 0) return localCached;
   }
 
   return null;
@@ -1250,12 +1500,23 @@ export async function fetchClassStudentsFromFirestore(className: string): Promis
  * Fetch all classes student rosters from Firestore with parallel promise handling and key normalization
  */
 export async function fetchAllStudentsFromFirestore(): Promise<Record<string, StudentRecord[]>> {
-  if (!db) return {};
-
   const allRosters: Record<string, StudentRecord[]> = {};
 
+  // Start with existing non-empty LocalStorage rosters so we never lose locally imported data
+  const localDb = getAllStudentsFromLocalStorage();
+  Object.entries(localDb).forEach(([k, list]) => {
+    if (!isExcludedK4Class(k) && Array.isArray(list) && list.length > 0) {
+      const std = getStandardClassName(k);
+      const key = normalizeClassKey(k);
+      allRosters[std] = list;
+      allRosters[key] = list;
+    }
+  });
+
+  if (!db) return allRosters;
+
   try {
-    // 1. Fetch role-scoped documents from 'class_rosters' collection (Admin: all, Teacher/Student: assigned classes)
+    // 1. Fetch role-scoped documents from 'class_rosters' collection
     const rostersSnap = await getScopedDocs('class_rosters');
     if (rostersSnap && !rostersSnap.empty) {
       rostersSnap.forEach((docSnap) => {
@@ -1265,17 +1526,15 @@ export async function fetchAllStudentsFromFirestore(): Promise<Record<string, St
           const stdName = getStandardClassName(rawName);
           const upperKey = normalizeClassKey(rawName);
           if (isExcludedK4Class(upperKey)) return;
-          const studentList = Array.isArray(data.students)
-            ? data.students
-            : (Array.isArray(data.studentList) ? data.studentList : (Array.isArray(data.roster) ? data.roster : []));
+          const studentList = extractStudentsArrayFromDoc(data);
 
           if (Array.isArray(studentList) && studentList.length > 0) {
-            const cleaned = deduplicateAndNormalizeStudents(studentList as StudentRecord[], stdName);
-            allRosters[stdName] = cleaned;
-            allRosters[upperKey] = cleaned;
-            try {
-              localStorage.setItem(`eduplay_k4_students_${upperKey}`, JSON.stringify(cleaned));
-            } catch {}
+            const cleaned = deduplicateAndNormalizeStudents(studentList, stdName);
+            const existing = allRosters[stdName] || [];
+            if (cleaned.length >= existing.length) {
+              allRosters[stdName] = cleaned;
+              allRosters[upperKey] = cleaned;
+            }
           }
         }
       });
@@ -1288,7 +1547,7 @@ export async function fetchAllStudentsFromFirestore(): Promise<Record<string, St
         const individualByClass: Record<string, StudentRecord[]> = {};
         studentsSnap.forEach((d) => {
           const sData = d.data() as StudentRecord;
-          const cls = sData.className || (sData as any).class || (sData as any).classId || (sData as any).lop;
+          const cls = sData.className || (sData as any).classKey || (sData as any).class || (sData as any).classId || (sData as any).lop;
           if (cls && !isExcludedK4Class(cls)) {
             const stdName = getStandardClassName(cls);
             if (!individualByClass[stdName]) individualByClass[stdName] = [];
@@ -1301,16 +1560,24 @@ export async function fetchAllStudentsFromFirestore(): Promise<Record<string, St
           const upperKey = normalizeClassKey(stdName);
           const existing = allRosters[stdName] || [];
           const mergedMap = new Map<string, StudentRecord>();
-          existing.forEach((s) => mergedMap.set(s.id, s));
-          stList.forEach((s) => mergedMap.set(s.id, s));
+          existing.forEach((s) => {
+            const codeKey = normalizeStudentCode(s.code || (s as any).studentCode || s.id) || s.id;
+            mergedMap.set(codeKey, s);
+          });
+          stList.forEach((s) => {
+            const codeKey = normalizeStudentCode(s.code || (s as any).studentCode || s.id) || s.id;
+            mergedMap.set(codeKey, s);
+          });
           const cleaned = deduplicateAndNormalizeStudents(Array.from(mergedMap.values()), stdName);
-          allRosters[stdName] = cleaned;
-          allRosters[upperKey] = cleaned;
+          if (cleaned.length > 0) {
+            allRosters[stdName] = cleaned;
+            allRosters[upperKey] = cleaned;
+          }
         });
       }
     } catch {}
 
-    // Save aggregated result to LocalStorage
+    // 3. Save aggregated result to LocalStorage and self-heal Firestore if local had students missing in cloud
     if (Object.keys(allRosters).length > 0) {
       saveAllStudentsToLocalStorage(allRosters);
     }
@@ -1323,38 +1590,58 @@ export async function fetchAllStudentsFromFirestore(): Promise<Record<string, St
 
 /**
  * Real-time listener for a class's student roster from Firestore
+ * Supports both "4C" and "Lớp 4C" document IDs and avoids wiping non-empty local rosters with stale empty docs
  */
 export function subscribeToFirestoreClassStudents(
   className: string,
   onUpdate: (students: StudentRecord[]) => void
 ): () => void {
   if (!db) return () => {};
+  if (isExcludedK4Class(className)) return () => {};
 
   try {
+    const stdName = getStandardClassName(className);
     const classKey = normalizeClassKey(className);
     const rosterRef = doc(db, 'class_rosters', classKey);
+
+    const handleIncomingStudents = (rawStudents: StudentRecord[]) => {
+      const cleaned = deduplicateAndNormalizeStudents(rawStudents, stdName);
+      if (cleaned.length > 0) {
+        saveStudentsToLocalStorage(stdName, cleaned);
+        onUpdate(cleaned);
+      } else {
+        // Only overwrite with [] if the class was explicitly cleared by user
+        const isExplicitlyCleared =
+          typeof window !== 'undefined' &&
+          (localStorage.getItem(`eduplay_k4_cleared_${classKey}`) === 'true' ||
+            localStorage.getItem(`eduplay_k4_cleared_${classKey.toLowerCase()}`) === 'true');
+        if (isExplicitlyCleared) {
+          onUpdate([]);
+        } else {
+          // Otherwise check if another doc variant or students collection has the data
+          fetchClassStudentsFromFirestore(stdName)
+            .then((resolved) => {
+              if (resolved && resolved.length > 0) {
+                onUpdate(resolved);
+              }
+            })
+            .catch(() => {});
+        }
+      }
+    };
 
     const unsubscribe = onSnapshot(
       rosterRef,
       async (docSnap) => {
         if (docSnap.exists()) {
-          const data = docSnap.data();
-          if (Array.isArray(data?.students)) {
-            saveStudentsToLocalStorage(className, data.students);
-            onUpdate(data.students as StudentRecord[]);
+          const arr = extractStudentsArrayFromDoc(docSnap.data());
+          handleIncomingStudents(arr);
+        } else {
+          // Fallback to "Lớp 4C" or lowercase "4c" document
+          const resolved = await fetchClassStudentsFromFirestore(stdName);
+          if (resolved && resolved.length > 0) {
+            onUpdate(resolved);
           }
-        } else if (classKey !== classKey.toLowerCase()) {
-          // Fallback to lowercase document if uppercase is not created yet
-          try {
-            const lowerSnap = await getDoc(doc(db, 'class_rosters', classKey.toLowerCase()));
-            if (lowerSnap.exists()) {
-              const data = lowerSnap.data();
-              if (Array.isArray(data?.students)) {
-                saveStudentsToLocalStorage(className, data.students);
-                onUpdate(data.students as StudentRecord[]);
-              }
-            }
-          } catch {}
         }
       },
       (error) => {

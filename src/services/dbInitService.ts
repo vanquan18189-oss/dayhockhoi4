@@ -1,13 +1,11 @@
 import { db } from './firebase';
 import {
-  purgeLegacy4A4BFromStorageAndFirestore,
-  purgeAllGrade4StudentsEverywhere
+  purgeLegacy4A4BFromStorageAndFirestore
 } from './studentStorageService';
 
 export async function initializeAndSyncAllCollections(): Promise<{ success: boolean; message: string }> {
   try {
     await purgeLegacy4A4BFromStorageAndFirestore();
-    await purgeAllGrade4StudentsEverywhere({ force: false });
     if (!db) {
       return { success: false, message: 'Chưa khởi tạo kết nối Firestore' };
     }

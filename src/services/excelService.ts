@@ -301,28 +301,30 @@ export function importStudentsFromExcel(
       return { success: false, students: [], totalCount: 0, error: 'File Excel không có sheet dữ liệu hợp lệ.' };
     }
 
-    // Chọn sheet danh sách học sinh (ưu tiên sheet đầu tiên hoặc sheet chứa tên lớp)
-    const targetSheetName =
+    // Chọn sheet có dữ liệu học sinh nhiều nhất (bỏ qua sheet hướng dẫn)
+    let targetSheetName =
       workbook.SheetNames.find((s) => !s.toLowerCase().includes('hướng dẫn')) || workbook.SheetNames[0];
-    const worksheet = workbook.Sheets[targetSheetName];
+    let rawRows: any[][] = [];
 
-    // Chuyển sheet sang mảng 2 chiều
-    const rawRows = XLSX.utils.sheet_to_json<any[]>(worksheet, { header: 1, defval: '' });
+    for (const sName of workbook.SheetNames) {
+      if (sName.toLowerCase().includes('hướng dẫn')) continue;
+      const ws = workbook.Sheets[sName];
+      const rows = XLSX.utils.sheet_to_json<any[]>(ws, { header: 1, defval: '' });
+      if (rows && rows.length > rawRows.length) {
+        rawRows = rows;
+        targetSheetName = sName;
+      }
+    }
+
+    if (rawRows.length === 0) {
+      const ws = workbook.Sheets[targetSheetName];
+      rawRows = XLSX.utils.sheet_to_json<any[]>(ws, { header: 1, defval: '' });
+    }
 
     if (!rawRows || rawRows.length === 0) {
       return { success: false, students: [], totalCount: 0, error: 'File Excel trống.' };
     }
 
-    // Cấu hình chỉ mục cột cố định mặc định theo chuẩn A -> I:
-    // Cột A (index 0): STT
-    // Cột B (index 1): Mã HS (Tên đăng nhập) -> username
-    // Cột C (index 2): Mật khẩu đăng nhập -> password
-    // Cột D (index 3): Họ và tên học sinh -> fullName
-    // Cột E (index 4): Số định danh (SĐCN/CCCD) -> idCard
-    // Cột F (index 5): Giới tính -> gender
-    // Cột G (index 6): Ngày sinh -> birthday
-    // Cột H (index 7): Họ tên phụ huynh -> parentName
-    // Cột I (index 8): Số điện thoại -> phone
     let colIndices = {
       stt: 0,
       username: 1,
@@ -337,50 +339,72 @@ export function importStudentsFromExcel(
 
     let headerRowIdx = -1;
 
-    // Hàm chuẩn hóa chuỗi tiêu đề để so khớp linh hoạt không phân biệt hoa thường, dấu tiếng Việt
     const norm = (s: any) =>
       String(s || '')
         .toLowerCase()
         .normalize('NFD')
         .replace(/[\u0300-\u036f]/g, '')
+        .replace(/đ/g, 'd')
         .replace(/[\s\(\)\/_\-\:\.]+/g, '');
 
-    for (let r = 0; r < Math.min(rawRows.length, 10); r++) {
+    for (let r = 0; r < Math.min(rawRows.length, 15); r++) {
       const row = rawRows[r];
       if (!Array.isArray(row)) continue;
 
       let matchCount = 0;
+      const tempIndices = {
+        stt: -1,
+        username: -1,
+        password: -1,
+        fullName: -1,
+        idCard: -1,
+        gender: -1,
+        birthday: -1,
+        parentName: -1,
+        phone: -1
+      };
 
       row.forEach((cellVal, cIdx) => {
         const cellNorm = norm(cellVal);
-        if (cellNorm === 'stt' || cellNorm === 'no' || cellNorm === 'thutu') {
-          colIndices.stt = cIdx;
+        if (!cellNorm) return;
+        if (cellNorm === 'stt' || cellNorm === 'no' || cellNorm === 'thutu' || cellNorm === 'sothutu') {
+          tempIndices.stt = cIdx;
           matchCount++;
         } else if (
           cellNorm.includes('mahs') ||
+          cellNorm.includes('mahocsinh') ||
           cellNorm.includes('tendangnhap') ||
           cellNorm.includes('taikhoan') ||
           cellNorm.includes('mshs') ||
-          cellNorm.includes('username')
+          cellNorm.includes('studentcode') ||
+          cellNorm.includes('username') ||
+          cellNorm === 'code' ||
+          cellNorm === 'ma'
         ) {
-          colIndices.username = cIdx;
+          tempIndices.username = cIdx;
           matchCount++;
         } else if (
           cellNorm.includes('matkhau') ||
           cellNorm.includes('pin') ||
           cellNorm.includes('pass') ||
-          cellNorm.includes('password')
+          cellNorm.includes('password') ||
+          cellNorm === 'mk'
         ) {
-          colIndices.password = cIdx;
+          tempIndices.password = cIdx;
           matchCount++;
         } else if (
-          cellNorm.includes('hovaten') ||
-          cellNorm.includes('hoten') ||
-          cellNorm.includes('tenhocsinh') ||
-          cellNorm === 'ten' ||
-          cellNorm.includes('fullname')
+          (cellNorm.includes('hovaten') ||
+            cellNorm.includes('hoten') ||
+            cellNorm.includes('tenhocsinh') ||
+            cellNorm.includes('tenhs') ||
+            cellNorm === 'ten' ||
+            cellNorm === 'name' ||
+            cellNorm.includes('fullname')) &&
+          !cellNorm.includes('phuhuynh') &&
+          !cellNorm.includes('cha') &&
+          !cellNorm.includes('me')
         ) {
-          colIndices.fullName = cIdx;
+          tempIndices.fullName = cIdx;
           matchCount++;
         } else if (
           cellNorm.includes('dinhdanh') ||
@@ -390,19 +414,20 @@ export function importStudentsFromExcel(
           cellNorm.includes('cmnd') ||
           cellNorm.includes('idcard')
         ) {
-          colIndices.idCard = cIdx;
+          tempIndices.idCard = cIdx;
           matchCount++;
-        } else if (cellNorm === 'gioitinh' || cellNorm === 'gender' || cellNorm === 'phai') {
-          colIndices.gender = cIdx;
+        } else if (cellNorm.includes('gioitinh') || cellNorm === 'gender' || cellNorm === 'gt' || cellNorm === 'phai') {
+          tempIndices.gender = cIdx;
           matchCount++;
         } else if (
           cellNorm.includes('ngaysinh') ||
-          cellNorm.includes('ns') ||
+          cellNorm === 'ns' ||
           cellNorm.includes('birthday') ||
           cellNorm.includes('dob') ||
-          cellNorm.includes('sinhngay')
+          cellNorm.includes('sinhngay') ||
+          cellNorm.includes('namsinh')
         ) {
-          colIndices.birthday = cIdx;
+          tempIndices.birthday = cIdx;
           matchCount++;
         } else if (
           cellNorm.includes('phuhuynh') ||
@@ -411,66 +436,105 @@ export function importStudentsFromExcel(
           cellNorm.includes('giamho') ||
           cellNorm.includes('parent')
         ) {
-          colIndices.parentName = cIdx;
+          tempIndices.parentName = cIdx;
           matchCount++;
         } else if (
           cellNorm.includes('dienthoai') ||
           cellNorm.includes('sdt') ||
           cellNorm.includes('phone') ||
-          cellNorm.includes('tel')
+          cellNorm.includes('tel') ||
+          cellNorm.includes('didong')
         ) {
-          colIndices.phone = cIdx;
+          tempIndices.phone = cIdx;
           matchCount++;
         }
       });
 
-      if (matchCount >= 3) {
-        headerRowIdx = r;
-        break;
+      if (matchCount >= 2 || tempIndices.fullName >= 0 || tempIndices.username >= 0) {
+        if (matchCount >= 2) {
+          headerRowIdx = r;
+          colIndices = {
+            stt: tempIndices.stt >= 0 ? tempIndices.stt : 0,
+            username: tempIndices.username >= 0 ? tempIndices.username : -1,
+            password: tempIndices.password >= 0 ? tempIndices.password : -1,
+            fullName: tempIndices.fullName >= 0 ? tempIndices.fullName : (tempIndices.username === 1 ? 2 : 1),
+            idCard: tempIndices.idCard >= 0 ? tempIndices.idCard : -1,
+            gender: tempIndices.gender >= 0 ? tempIndices.gender : -1,
+            birthday: tempIndices.birthday >= 0 ? tempIndices.birthday : -1,
+            parentName: tempIndices.parentName >= 0 ? tempIndices.parentName : -1,
+            phone: tempIndices.phone >= 0 ? tempIndices.phone : -1
+          };
+          break;
+        }
       }
     }
 
-    const startDataRow = headerRowIdx >= 0 ? headerRowIdx + 1 : 1;
+    const startDataRow = headerRowIdx >= 0 ? headerRowIdx + 1 : 0;
     const parsedStudents: StudentRecord[] = [];
-    const prefix = fallbackClass.replace(/Lớp\s*/i, '').toLowerCase();
+    const prefix = fallbackClass.replace(/Lớp\s*/i, '').trim().toUpperCase() || '4C';
 
     for (let i = startDataRow; i < rawRows.length; i++) {
       const row = rawRows[i];
       if (!Array.isArray(row) || row.length === 0) continue;
 
-      const rawFullName = String(row[colIndices.fullName] || '').trim();
-      const rawUsername = String(row[colIndices.username] || '').trim();
+      let rawFullName = colIndices.fullName >= 0 ? String(row[colIndices.fullName] || '').trim() : '';
+      let rawUsername = colIndices.username >= 0 ? String(row[colIndices.username] || '').trim() : '';
 
-      // Bỏ qua dòng trống hoặc dòng hướng dẫn/tổng kết
+      // Tự động dò cột tên và mã nếu file Excel có thứ tự cột khác mẫu 9 cột
+      if (!rawFullName) {
+        for (let c = 0; c < Math.min(row.length, 6); c++) {
+          if (c === colIndices.stt || c === colIndices.username || c === colIndices.password) continue;
+          const val = String(row[c] || '').trim();
+          if (val && val.includes(' ') && !/^\d+$/.test(val) && !/^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}$/.test(val)) {
+            rawFullName = val;
+            break;
+          }
+        }
+      }
+
       if (!rawFullName && !rawUsername) continue;
-      if (rawFullName.toLowerCase().includes('hướng dẫn') || rawFullName.toLowerCase().includes('tổng cộng')) continue;
+      const lowerCheck = (rawFullName + ' ' + rawUsername).toLowerCase();
+      if (
+        lowerCheck.includes('hướng dẫn') ||
+        lowerCheck.includes('tổng cộng') ||
+        lowerCheck.includes('danh sách học sinh') ||
+        (rawFullName.toLowerCase() === 'họ và tên' || rawFullName.toLowerCase() === 'họ tên')
+      ) {
+        continue;
+      }
 
       const sttNum =
-        parseInt(String(row[colIndices.stt] || parsedStudents.length + 1), 10) || parsedStudents.length + 1;
-      const usernameVal = rawUsername || `${prefix}${sttNum}`;
-      const passwordVal = String(row[colIndices.password] || '123456').replace(/^'/, '').trim() || '123456';
-      const fullNameVal = rawFullName || '';
-      const idCardVal = String(row[colIndices.idCard] || '').replace(/^'/, '').trim();
-      
-      const rawGender = String(row[colIndices.gender] || '').trim();
+        (colIndices.stt >= 0 ? parseInt(String(row[colIndices.stt] || ''), 10) : NaN) || parsedStudents.length + 1;
+      const rawCodeFormatted = formatStandardStudentCode(rawUsername, prefix, sttNum);
+      const usernameVal = rawCodeFormatted;
+      const passwordVal =
+        (colIndices.password >= 0 ? String(row[colIndices.password] || '').replace(/^'/, '').trim() : '') || '123456';
+      const fullNameVal = rawFullName || `Học sinh ${sttNum}`;
+      const idCardVal =
+        colIndices.idCard >= 0 ? String(row[colIndices.idCard] || '').replace(/^'/, '').trim() : '';
+
+      const rawGender = colIndices.gender >= 0 ? String(row[colIndices.gender] || '').trim() : 'Nam';
       const genderVal: 'Nam' | 'Nữ' =
-        rawGender.toLowerCase() === 'nữ' || rawGender.toLowerCase() === 'nu' || rawGender.toLowerCase() === 'female'
+        rawGender.toLowerCase().includes('nữ') ||
+        rawGender.toLowerCase().includes('nu') ||
+        rawGender.toLowerCase() === 'female' ||
+        rawGender.toLowerCase() === 'f'
           ? 'Nữ'
           : 'Nam';
 
-      const birthdayVal = parseExcelDate(row[colIndices.birthday]);
-      const parentNameVal = String(row[colIndices.parentName] || '').trim();
-      const phoneVal = String(row[colIndices.phone] || '').replace(/^'/, '').trim();
+      const birthdayVal = colIndices.birthday >= 0 ? parseExcelDate(row[colIndices.birthday]) : '10/10/2016';
+      const parentNameVal = colIndices.parentName >= 0 ? String(row[colIndices.parentName] || '').trim() : '';
+      const phoneVal = colIndices.phone >= 0 ? String(row[colIndices.phone] || '').replace(/^'/, '').trim() : '';
       const emailVal = usernameVal ? `hs.${usernameVal.toLowerCase()}@quanghungpk1.edu.vn` : '';
 
-      // Chọn avatar ngẫu nhiên theo số thứ tự
       const avatarId = (sttNum % 10) + 1;
       const avatar = `https://images.unsplash.com/photo-${1535713875002 + avatarId}?w=100&auto=format&fit=crop`;
 
-      const studentItem: StudentRecord = {
-        id: `st-${prefix}-${sttNum}`,
+      const studentItem = {
+        id: `st-${prefix.toLowerCase()}-${sttNum}`,
         stt: sttNum,
         code: usernameVal,
+        studentCode: usernameVal,
         username: usernameVal,
         pin: passwordVal,
         password: passwordVal,
@@ -491,7 +555,7 @@ export function importStudentsFromExcel(
         notes: 'Dữ liệu nhập từ file Excel chuẩn 9 cột',
         avatar,
         address: 'Thôn Quang Hưng, Xã Phú Ký'
-      };
+      } as StudentRecord;
 
       parsedStudents.push(studentItem);
     }

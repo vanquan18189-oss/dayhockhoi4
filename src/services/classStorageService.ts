@@ -42,13 +42,44 @@ export function normalizeClassKeyStrict(rawName?: string): string {
 }
 
 /**
- * Format class name string uniformly to "Lớp 3C" (never "Lớp LỚP 3C")
+ * Format class name string uniformly to "Lớp 4C" (never "Lớp LỚP 4C")
  */
 export function formatClassName(rawName?: string): string {
   if (!rawName) return '';
   const key = normalizeClassKeyStrict(rawName);
   if (!key) return '';
   return `Lớp ${key}`;
+}
+
+/**
+ * So sánh linh hoạt 2 tên lớp (ví dụ "Lớp 4C", "4C", "4c", " LỚP  4c " đều khớp nhau)
+ */
+export function isSameClassNameFlexible(classA?: string, classB?: string): boolean {
+  const keyA = normalizeClassKeyStrict(classA);
+  const keyB = normalizeClassKeyStrict(classB);
+  if (!keyA || !keyB) return false;
+  return keyA === keyB;
+}
+
+/**
+ * Sinh danh sách các biến thể tên lớp để dùng cho truy vấn Firestore where(..., 'in', ...)
+ * Ví dụ: "Lớp 4C" -> ["Lớp 4C", "4C", "4c", "lớp 4c", "LỚP 4C", "Lớp 4c", "C-4C"]
+ */
+export function getClassNameQueryVariants(rawClassName?: string): string[] {
+  const key = normalizeClassKeyStrict(rawClassName) || '4C';
+  const stdName = `Lớp ${key}`;
+  const lowerKey = key.toLowerCase();
+  return Array.from(
+    new Set([
+      stdName,
+      key,
+      lowerKey,
+      stdName.toLowerCase(),
+      stdName.toUpperCase(),
+      `Lớp ${lowerKey}`,
+      `C-${key}`
+    ])
+  );
 }
 
 /**
@@ -120,9 +151,15 @@ export function subscribeRealtimeClasses(callback: (classes: SchoolClassItem[]) 
     const unsub = subscribeScopedCollection(
       'classes',
       (snapshot) => {
-        if (!snapshot.empty) {
-          const classMap = new Map<string, SchoolClassItem>();
+        const classMap = new Map<string, SchoolClassItem>();
+        REAL_SCHOOL_CLASSES_FALLBACK.forEach((fallbackCls) => {
+          const fKey = normalizeClassKeyStrict(fallbackCls.name || fallbackCls.id);
+          if (fKey && fKey !== '4A' && fKey !== '4B') {
+            classMap.set(fKey, { ...fallbackCls, id: fKey, name: `Lớp ${fKey}`, grade: 'Khối 4' });
+          }
+        });
 
+        if (!snapshot.empty) {
           snapshot.forEach((docSnap) => {
             const data = docSnap.data();
             const rawId = (docSnap.id || data.id || data.classId || '').trim();
@@ -151,25 +188,21 @@ export function subscribeRealtimeClasses(callback: (classes: SchoolClassItem[]) 
               const existing = classMap.get(normalizedKey)!;
               classMap.set(normalizedKey, {
                 ...existing,
-                name: existing.name || newItem.name,
-                grade: existing.grade || newItem.grade,
-                room: existing.room || newItem.room,
-                homeroomTeacher: existing.homeroomTeacher || newItem.homeroomTeacher,
-                subjects: (existing.subjects && existing.subjects.length > 0) ? existing.subjects : newItem.subjects
+                name: newItem.name || existing.name,
+                grade: 'Khối 4',
+                room: newItem.room || existing.room,
+                homeroomTeacher: newItem.homeroomTeacher || existing.homeroomTeacher,
+                subjects: (Array.isArray(data.subjects) && data.subjects.length > 0) ? data.subjects : existing.subjects
               });
             } else {
               classMap.set(normalizedKey, newItem);
             }
           });
-
-          const list = Array.from(classMap.values());
-          if (list.length > 0) {
-            list.sort((a, b) => a.name.localeCompare(b.name, 'vi', { numeric: true }));
-            callback(list);
-            return;
-          }
         }
-        callback(REAL_SCHOOL_CLASSES_FALLBACK);
+
+        const list = Array.from(classMap.values());
+        list.sort((a, b) => a.name.localeCompare(b.name, 'vi', { numeric: true }));
+        callback(list.length > 0 ? list : REAL_SCHOOL_CLASSES_FALLBACK);
       },
       (err) => {
         console.warn('Firestore classes subscription warning:', err);
