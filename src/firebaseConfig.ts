@@ -13,13 +13,13 @@ import {
 import { getAuth, Auth } from "firebase/auth";
 
 export const firebaseConfig = {
-  apiKey: "AIzaSyCposG8jGC7Z_RsUDd1BCLyLtbCkD6AtAs",
-  authDomain: "dayhockhoi4-fb50c.firebaseapp.com",
-  projectId: "dayhockhoi4-fb50c",
-  storageBucket: "dayhockhoi4-fb50c.firebasestorage.app",
-  messagingSenderId: "790815510589",
-  appId: "1:790815510589:web:226835314651490aa5da54",
-  measurementId: "G-1SSG7WN1KG"
+  apiKey: "AIzaSyCaB5uJUspOJrPmDJAR8gpb7zTt7pwwROY",
+  authDomain: "dayhockhoi4.firebaseapp.com",
+  projectId: "dayhockhoi4",
+  storageBucket: "dayhockhoi4.firebasestorage.app",
+  messagingSenderId: "786618686046",
+  appId: "1:786618686046:web:fae7ac57c10d5c2c8ef2cf",
+  measurementId: "G-F539RT65NV"
 };
 
 export const app: FirebaseApp = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
@@ -261,13 +261,24 @@ if (typeof window !== 'undefined') {
   setTimeout(() => {
     testFirestoreServerConnectionOnBoot().catch(() => {});
     
-    // Cleanup old localStorage keys
+    // Cleanup old localStorage keys without wiping active teacher/student sessions
     const CLEANUP_FLAG = 'eduplay_k4_storage_v2_initialized';
     if (!localStorage.getItem(CLEANUP_FLAG)) {
       const keysToKeep = [
+        'eduplay_k4_active_session',
+        'eduplay_k4_active_role',
+        'eduplay_k4_active_module',
+        'eduplay_k4_sso_active',
+        'eduplay_k4_sso_session',
+        'eduplay_k4_sso_current_user',
+        'eduplay_k4_sso_token',
         'eduplay_k4_teacher_email',
         'eduplay_k4_teacher_name',
+        'eduplay_k4_teacher_id',
+        'eduplay_k4_teacher_profile',
         'eduplay_k4_student_session',
+        'eduplay_k4_current_class',
+        'eduplay_k4_active_class',
         'eduplay_k4_gemini_api_key',
         'eduplay_k4_selected_academic_year',
         'eduplay_k4_selected_semester',

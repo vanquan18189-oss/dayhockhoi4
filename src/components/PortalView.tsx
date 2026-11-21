@@ -393,13 +393,25 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
     };
   }, [selectedClass]);
 
-  // Helper to persist teacher info
-  const saveTeacherSession = (email: string, name?: string) => {
+  // Helper to persist teacher info & active session state immediately
+  const saveTeacherSession = (email: string, name?: string, role: UserRole = 'teacher', teacherId?: string) => {
     try {
-      localStorage.setItem('eduplay_k4_teacher_email', email);
+      const cleanEmail = email.trim().toLowerCase();
+      localStorage.setItem('eduplay_k4_active_session', 'true');
+      localStorage.setItem('eduplay_k4_active_role', role);
+      localStorage.removeItem('eduplay_k4_sso_active');
+      localStorage.setItem('eduplay_k4_teacher_email', cleanEmail);
       if (name) {
         localStorage.setItem('eduplay_k4_teacher_name', name);
       }
+      if (teacherId) {
+        localStorage.setItem('eduplay_k4_teacher_id', teacherId);
+      }
+      window.dispatchEvent(
+        new CustomEvent('eduplay_teacher_session_updated', {
+          detail: { email: cleanEmail, name: name || '', role }
+        })
+      );
     } catch (e) {
       console.warn('Cannot save teacher session to localStorage', e);
     }
@@ -515,67 +527,103 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
     setIsAuthLoading(true);
 
     try {
-      if (!teacherEmail || !teacherPassword) {
-        throw new Error('Vui lòng nhập đầy đủ email và mật khẩu.');
+      const cleanEmail = (teacherEmail || '').trim().toLowerCase();
+      const rawPassword = (teacherPassword || '').trim();
+
+      if (!cleanEmail) {
+        throw new Error('Vui lòng nhập địa chỉ email giáo viên / quản trị viên.');
+      }
+      if (!rawPassword) {
+        throw new Error('Vui lòng nhập mật khẩu đăng nhập.');
+      }
+      if (rawPassword.length < 6) {
+        throw new Error('Mật khẩu phải có ít nhất 6 ký tự.');
       }
 
-      const cleanEmail = teacherEmail.trim().toLowerCase();
-
-      // Check whitelist before allowing access
+      // 1. Kiểm tra quyền giáo viên/admin trên Firestore (`teachers`, `users`, `to_chuyen_mon`, danh mục chuẩn & Super Admin)
       const authCheck = await verifyTeacherAuthorization(cleanEmail);
       if (!authCheck.authorized || !authCheck.profile) {
         throw new Error(
-          authCheck.reason || 'Tài khoản này chưa được đăng ký trong hệ thống. Vui lòng liên hệ quản trị viên.'
+          authCheck.reason ||
+            `Tài khoản (${cleanEmail}) chưa được đăng ký trong hệ thống giáo viên Khối 4. Vui lòng liên hệ Quản trị viên.`
         );
       }
 
+      // 2. Thử đăng nhập với Firebase Auth (nếu dự án dayhockhoi4 đã bật Email/Password provider)
       if (auth) {
         try {
-          await signInWithEmailAndPassword(auth, cleanEmail, teacherPassword);
+          await signInWithEmailAndPassword(auth, cleanEmail, rawPassword);
         } catch (signInErr: any) {
-          const code = signInErr?.code || '';
-          console.warn('Firebase signInWithEmailAndPassword warning:', code);
+          const code = String(signInErr?.code || '');
+          const msg = String(signInErr?.message || '');
+          console.warn('Firebase signInWithEmailAndPassword notice:', code, msg);
 
-          // If user does not exist in Firebase Auth yet, auto-provision with the provided password
-          if (
-            (code === 'auth/user-not-found' || code === 'auth/invalid-credential') &&
-            teacherPassword.length >= 6
+          if (code === 'auth/wrong-password') {
+            throw new Error('Mật khẩu không chính xác. Vui lòng kiểm tra lại mật khẩu!');
+          } else if (code === 'auth/too-many-requests') {
+            throw new Error('Tài khoản tạm thời bị khóa do nhập sai nhiều lần. Vui lòng thử lại sau ít phút.');
+          } else if (
+            code === 'auth/user-not-found' ||
+            code === 'auth/invalid-credential' ||
+            code === 'auth/invalid-login-credentials'
           ) {
+            // Thử tự động khởi tạo tài khoản trên project Firebase mới `dayhockhoi4`
             try {
-              await createUserWithEmailAndPassword(auth, cleanEmail, teacherPassword);
-              console.log('✅ Đã tạo tài khoản Firebase Auth cho giáo viên:', cleanEmail);
+              await createUserWithEmailAndPassword(auth, cleanEmail, rawPassword);
+              console.log('✅ Đã tự động đồng bộ tài khoản giáo viên trên Firebase Auth (dayhockhoi4):', cleanEmail);
             } catch (createErr: any) {
-              const createCode = createErr?.code || '';
+              const createCode = String(createErr?.code || '');
               if (createCode === 'auth/email-already-in-use') {
-                // Email is already in Firebase Auth, but password was wrong
-                throw new Error('Email hoặc mật khẩu không chính xác. Vui lòng kiểm tra lại!');
+                // Tài khoản đã tồn tại trên Firebase Auth của dự án này nhưng mật khẩu nhập vào không khớp
+                throw new Error('Mật khẩu không chính xác cho tài khoản này. Vui lòng kiểm tra lại mật khẩu!');
               } else {
-                console.warn('Không thể tự động tạo Firebase Auth account, chuyển sang phiên xác thực được cấp quyền:', createErr?.message || createErr);
+                // Ví dụ: auth/operation-not-allowed (chưa bật Email/Password trên Firebase Console dự án dayhockhoi4)
+                console.warn(
+                  'Firebase Auth trên dự án dayhockhoi4 chưa bật Email/Password hoặc gặp giới hạn, cho phép đăng nhập theo hồ sơ giáo viên hợp lệ:',
+                  createCode
+                );
               }
             }
-          } else if (code === 'auth/wrong-password') {
-            throw new Error('Email hoặc mật khẩu không chính xác. Vui lòng kiểm tra lại!');
           } else {
-            console.warn('Firebase Auth báo lỗi, nhưng tài khoản nằm trong danh mục giáo viên hợp lệ:', signInErr?.message || signInErr);
+            // Lỗi cấu hình provider (auth/operation-not-allowed, auth/configuration-not-found) hoặc mạng:
+            // Cho phép tiếp tục vì tài khoản đã được xác thực hợp lệ trong danh sách giáo viên/admin
+            console.warn(
+              'Bỏ qua cảnh báo Firebase Auth provider, đăng nhập theo danh sách giáo viên được cấp quyền:',
+              code
+            );
           }
         }
       }
 
+      // 3. Thiết lập phiên đăng nhập và chuyển thẳng vào giao diện làm việc
       const profile = authCheck.profile;
-      const resolvedName = profile.name || resolveTeacherNameByEmail(cleanEmail, teacherName);
-      saveTeacherSession(cleanEmail, resolvedName);
-      onSelectPortal(profile.userRole, 'Khối 4', 'Lớp 4C', { email: cleanEmail, name: resolvedName });
+      const resolvedRole: UserRole = profile.userRole === 'admin' ? 'admin' : 'teacher';
+      const resolvedName =
+        profile.name || resolveTeacherNameByEmail(cleanEmail, teacherName, undefined, resolvedRole);
+
+      saveTeacherSession(cleanEmail, resolvedName, resolvedRole, profile.id);
+      onSelectPortal(resolvedRole, 'Khối 4', 'Lớp 4C', {
+        email: cleanEmail,
+        name: resolvedName
+      });
     } catch (err: any) {
-      console.warn('Teacher login notice:', err?.message || err);
-      // Ensure any authenticated session is invalidated on authorization failure
+      console.warn('Teacher login error:', err?.message || err);
       if (auth && auth.currentUser) {
         try {
           await signOut(auth);
         } catch {}
       }
-      let errMsg = err.message || 'Đăng nhập thất bại';
-      if (errMsg.includes('wrong-password') || errMsg.includes('invalid-credential') || errMsg.includes('user-not-found')) {
+      let errMsg = err?.message || 'Đăng nhập thất bại. Vui lòng kiểm tra lại thông tin.';
+      if (
+        errMsg.includes('auth/wrong-password') ||
+        errMsg.includes('auth/invalid-credential') ||
+        errMsg.includes('auth/user-not-found')
+      ) {
         errMsg = 'Email hoặc mật khẩu không chính xác. Vui lòng kiểm tra lại!';
+      } else if (errMsg.includes('auth/network-request-failed')) {
+        errMsg = 'Lỗi kết nối mạng khi xác thực với máy chủ. Vui lòng kiểm tra kết nối Internet và thử lại.';
+      } else if (errMsg.includes('auth/invalid-email')) {
+        errMsg = 'Định dạng địa chỉ email không hợp lệ. Vui lòng kiểm tra lại.';
       }
       setAuthError(errMsg);
     } finally {
@@ -589,7 +637,7 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
     setIsAuthLoading(true);
     try {
       if (!auth) {
-        throw new Error('Dịch vụ xác thực Firebase chưa sẵn sàng. Vui lòng thử lại sau.');
+        throw new Error('Dịch vụ xác thực Firebase chưa sẵn sàng. Vui lòng đăng nhập bằng Email & Mật khẩu bên trên.');
       }
 
       const provider = new GoogleAuthProvider();
@@ -600,43 +648,62 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
 
       if (!email) {
         await signOut(auth);
-        throw new Error('Không thể xác thực địa chỉ email từ tài khoản Google.');
+        throw new Error('Không thể lấy địa chỉ email từ tài khoản Google của bạn.');
       }
 
-      // Step 1: Whitelist Verification query against Firestore collections & registered teachers
+      // Kiểm tra tài khoản Google trong danh sách giáo viên / admin
       const authCheck = await verifyTeacherAuthorization(email);
       if (!authCheck.authorized || !authCheck.profile) {
-        // Step 2: Immediately sign out unauthorized user from Firebase Auth session
         await signOut(auth);
-        // Step 3: Reject access & show clear localized error
         throw new Error(
-          'Tài khoản Google này chưa được đăng ký trong hệ thống. Vui lòng liên hệ quản trị viên.'
+          authCheck.reason ||
+            `Tài khoản Google (${email}) chưa được đăng ký trong hệ thống giáo viên Khối 4. Vui lòng liên hệ Quản trị viên.`
         );
       }
 
-      // Step 4: Proceed to appropriate dashboard ONLY when email matches registered teacher/admin record
       const profile = authCheck.profile;
-      const resolvedName = profile.name || gUser.displayName || resolveTeacherNameByEmail(email, teacherName);
-      saveTeacherSession(email, resolvedName);
-      onSelectPortal(profile.userRole, 'Khối 4', 'Lớp 4C', { email, name: resolvedName });
+      const resolvedRole: UserRole = profile.userRole === 'admin' ? 'admin' : 'teacher';
+      const resolvedName =
+        profile.name || gUser.displayName || resolveTeacherNameByEmail(email, teacherName, undefined, resolvedRole);
+
+      saveTeacherSession(email, resolvedName, resolvedRole, profile.id);
+      onSelectPortal(resolvedRole, 'Khối 4', 'Lớp 4C', { email, name: resolvedName });
     } catch (err: any) {
       console.error('Google Sign In error:', err);
-      // Safety guarantee: Ensure signOut on any authorization/login failure
       if (auth && auth.currentUser) {
         try {
           await signOut(auth);
         } catch {}
       }
-      let errMsg = err.message || 'Đăng nhập Google thất bại';
+      const code = String(err?.code || '');
+      let errMsg = String(err?.message || 'Đăng nhập bằng Google thất bại.');
       const currentHost = typeof window !== 'undefined' ? window.location.hostname : '';
+
       if (
-        err?.code === 'auth/unauthorized-domain' ||
+        code === 'auth/unauthorized-domain' ||
         errMsg.includes('auth/unauthorized-domain') ||
         errMsg.includes('unauthorized-domain')
       ) {
         errMsg = `UNAUTHORIZED_DOMAIN_ERROR:${currentHost}`;
-      } else if (errMsg.includes('popup-closed-by-user')) {
-        errMsg = 'Cửa sổ đăng nhập Google đã bị đóng. Vui lòng thử lại.';
+      } else if (
+        code === 'auth/operation-not-allowed' ||
+        code === 'auth/configuration-not-found' ||
+        errMsg.includes('operation-not-allowed') ||
+        errMsg.includes('configuration-not-found')
+      ) {
+        errMsg =
+          'Phương thức "Đăng nhập bằng Google" chưa được bật trong Firebase Console của dự án dayhockhoi4 (Authentication -> Sign-in method -> Google). Thầy/Cô vui lòng nhập Email (ví dụ: thuthuthtk@gmail.com) và Mật khẩu rồi bấm "Bắt đầu làm việc ngay" ở trên để vào hệ thống ngay!';
+      } else if (code === 'auth/popup-blocked' || errMsg.includes('popup-blocked')) {
+        errMsg =
+          'Trình duyệt đã chặn cửa sổ bật lên (Popup). Vui lòng cho phép Popup hoặc đăng nhập trực tiếp bằng Email & Mật khẩu ở biểu mẫu bên trên.';
+      } else if (
+        code === 'auth/popup-closed-by-user' ||
+        code === 'auth/cancelled-popup-request' ||
+        errMsg.includes('popup-closed-by-user')
+      ) {
+        errMsg = 'Cửa sổ đăng nhập Google đã bị đóng trước khi hoàn tất. Bạn có thể thử lại hoặc đăng nhập bằng Email & Mật khẩu ở trên.';
+      } else if (code === 'auth/network-request-failed' || errMsg.includes('network-request-failed')) {
+        errMsg = 'Lỗi kết nối mạng khi liên hệ máy chủ Google. Vui lòng kiểm tra Internet hoặc đăng nhập bằng Email & Mật khẩu ở trên.';
       }
       setAuthError(errMsg);
     } finally {
@@ -1172,11 +1239,14 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
                 <input
                   type="email"
                   required
-                  autoComplete="off"
-                  name="random_email_xyz_9812"
+                  autoComplete="email"
+                  name="teacher_email"
                   value={teacherEmail}
-                  onChange={(e) => setTeacherEmail(e.target.value)}
-                  placeholder="Nhập địa chỉ email..."
+                  onChange={(e) => {
+                    setTeacherEmail(e.target.value);
+                    if (authError) setAuthError(null);
+                  }}
+                  placeholder="Nhập địa chỉ email (ví dụ: thuthuthtk@gmail.com)..."
                   className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white text-sm text-slate-800 font-medium"
                 />
               </div>
@@ -1188,12 +1258,13 @@ export function PortalView({ onSelectPortal }: PortalViewProps) {
                 <input
                   type="password"
                   required
-                  autoComplete="new-password"
-                  name="secure_password_field_xyz_7749"
-                  readOnly
-                  onFocus={(e) => e.target.removeAttribute('readonly')}
+                  autoComplete="current-password"
+                  name="teacher_password"
                   value={teacherPassword}
-                  onChange={(e) => setTeacherPassword(e.target.value)}
+                  onChange={(e) => {
+                    setTeacherPassword(e.target.value);
+                    if (authError) setAuthError(null);
+                  }}
                   placeholder="••••••••"
                   className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white text-sm text-slate-800"
                 />

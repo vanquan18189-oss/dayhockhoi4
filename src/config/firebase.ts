@@ -13,13 +13,13 @@ import {
 } from "../firebaseConfig";
 
 export const firebaseConfig = {
-  apiKey: "AIzaSyCposG8jGC7Z_RsUDd1BCLyLtbCkD6AtAs",
-  authDomain: "dayhockhoi4-fb50c.firebaseapp.com",
-  projectId: "dayhockhoi4-fb50c",
-  storageBucket: "dayhockhoi4-fb50c.firebasestorage.app",
-  messagingSenderId: "790815510589",
-  appId: "1:790815510589:web:226835314651490aa5da54",
-  measurementId: "G-1SSG7WN1KG"
+  apiKey: "AIzaSyCaB5uJUspOJrPmDJAR8gpb7zTt7pwwROY",
+  authDomain: "dayhockhoi4.firebaseapp.com",
+  projectId: "dayhockhoi4",
+  storageBucket: "dayhockhoi4.firebasestorage.app",
+  messagingSenderId: "786618686046",
+  appId: "1:786618686046:web:fae7ac57c10d5c2c8ef2cf",
+  measurementId: "G-F539RT65NV"
 };
 
 export const app = defaultApp || (getApps().length > 0 ? getApp() : initializeApp(firebaseConfig));

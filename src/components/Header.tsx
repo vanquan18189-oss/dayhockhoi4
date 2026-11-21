@@ -220,9 +220,14 @@ export const Header: React.FC<HeaderProps> = ({
         });
         return;
       }
+      localStorage.setItem('eduplay_k4_active_session', 'true');
+      localStorage.setItem('eduplay_k4_active_role', authCheck.profile.userRole || 'teacher');
       localStorage.setItem('eduplay_k4_teacher_email', email);
       if (authCheck.profile.name) {
         localStorage.setItem('eduplay_k4_teacher_name', authCheck.profile.name);
+      }
+      if (authCheck.profile.id) {
+        localStorage.setItem('eduplay_k4_teacher_id', authCheck.profile.id);
       }
       window.dispatchEvent(new CustomEvent('eduplay_teacher_session_updated'));
     } catch (e: any) {
@@ -233,8 +238,9 @@ export const Header: React.FC<HeaderProps> = ({
         } catch {}
       }
       const currentHost = typeof window !== 'undefined' ? window.location.hostname : '';
+      const code = String(e?.code || '');
       if (
-        e?.code === 'auth/unauthorized-domain' ||
+        code === 'auth/unauthorized-domain' ||
         e?.message?.includes('auth/unauthorized-domain') ||
         e?.message?.includes('unauthorized-domain')
       ) {
@@ -243,11 +249,22 @@ export const Header: React.FC<HeaderProps> = ({
           message:
             `Mã lỗi: auth/unauthorized-domain\n` +
             `Tên miền hiện tại: "${currentHost}"\n\n` +
-            `Hướng dẫn mở quyền trên Firebase Console:\n` +
-            `1. Truy cập Firebase Console -> chọn Dự án của bạn.\n` +
+            `Hướng dẫn mở quyền trên Firebase Console (Dự án dayhockhoi4):\n` +
+            `1. Truy cập Firebase Console -> chọn dự án dayhockhoi4.\n` +
             `2. Vào Authentication -> tab Settings -> Authorized domains.\n` +
             `3. Bấm "Add domain" và dán tên miền: ${currentHost}\n` +
-            `4. Bấm Lưu và thử lại sau ít phút.`
+            `4. Bấm Lưu và thử lại.`
+        });
+      } else if (
+        code === 'auth/operation-not-allowed' ||
+        code === 'auth/configuration-not-found' ||
+        e?.message?.includes('operation-not-allowed') ||
+        e?.message?.includes('configuration-not-found')
+      ) {
+        setAuthErrorDialog({
+          title: 'Chưa bật Google Sign-In trên dự án dayhockhoi4',
+          message:
+            'Phương thức Đăng nhập bằng Google chưa được kích hoạt trong Firebase Console của dự án dayhockhoi4 (Authentication -> Sign-in method -> Google). Vui lòng bật Google provider hoặc đăng nhập bằng Email & Mật khẩu tại Cổng Giáo Viên.'
         });
       } else if (!e?.message?.includes('popup-closed-by-user')) {
         setAuthErrorDialog({

@@ -13,13 +13,13 @@ import {
 } from "./firebaseConfig";
 
 export const firebaseConfig = {
-  apiKey: (import.meta as any).env?.VITE_FIREBASE_API_KEY || "AIzaSyCposG8jGC7Z_RsUDd1BCLyLtbCkD6AtAs",
-  authDomain: (import.meta as any).env?.VITE_FIREBASE_AUTH_DOMAIN || "dayhockhoi4-fb50c.firebaseapp.com",
-  projectId: (import.meta as any).env?.VITE_FIREBASE_PROJECT_ID || "dayhockhoi4-fb50c",
-  storageBucket: (import.meta as any).env?.VITE_FIREBASE_STORAGE_BUCKET || "dayhockhoi4-fb50c.firebasestorage.app",
-  messagingSenderId: (import.meta as any).env?.VITE_FIREBASE_MESSAGING_SENDER_ID || "790815510589",
-  appId: (import.meta as any).env?.VITE_FIREBASE_APP_ID || "1:790815510589:web:226835314651490aa5da54",
-  measurementId: (import.meta as any).env?.VITE_FIREBASE_MEASUREMENT_ID || "G-1SSG7WN1KG"
+  apiKey: (import.meta as any).env?.VITE_FIREBASE_API_KEY || "AIzaSyCaB5uJUspOJrPmDJAR8gpb7zTt7pwwROY",
+  authDomain: (import.meta as any).env?.VITE_FIREBASE_AUTH_DOMAIN || "dayhockhoi4.firebaseapp.com",
+  projectId: (import.meta as any).env?.VITE_FIREBASE_PROJECT_ID || "dayhockhoi4",
+  storageBucket: (import.meta as any).env?.VITE_FIREBASE_STORAGE_BUCKET || "dayhockhoi4.firebasestorage.app",
+  messagingSenderId: (import.meta as any).env?.VITE_FIREBASE_MESSAGING_SENDER_ID || "786618686046",
+  appId: (import.meta as any).env?.VITE_FIREBASE_APP_ID || "1:786618686046:web:fae7ac57c10d5c2c8ef2cf",
+  measurementId: (import.meta as any).env?.VITE_FIREBASE_MEASUREMENT_ID || "G-F539RT65NV"
 };
 
 export const app = defaultApp || (getApps().length > 0 ? getApp() : initializeApp(firebaseConfig));

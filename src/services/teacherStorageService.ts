@@ -1,4 +1,5 @@
 import { TeacherRecord, initialTeachersList } from '../data/defaultTeachers';
+import { CANONICAL_TEACHER_DIRECTORY } from '../constants/teacherDirectory';
 export { initialTeachersList };
 export type { TeacherRecord };
 import { db, auth } from './firebase';
@@ -523,15 +524,16 @@ export interface AuthorizationResult {
 
 /**
  * Strict Whitelist Authorization check for Google Sign-In and Email/Password.
- * Queries Firestore `teachers`, `users`, `to_chuyen_mon` and local verified rosters.
- * Returns authorized = true ONLY if the email belongs to an active registered teacher/admin.
+ * Queries Super Admin list, Firestore `teachers`, `users`, `to_chuyen_mon`, CANONICAL_TEACHER_DIRECTORY, and local verified rosters.
+ * Returns authorized = true if the email belongs to an active registered teacher/admin.
  */
 export async function verifyTeacherAuthorization(email?: string | null): Promise<AuthorizationResult> {
-  const cleanEmail = (email || '').toLowerCase().trim();
-  if (!cleanEmail) {
+  const rawInput = (email || '').trim();
+  const cleanEmail = rawInput.toLowerCase();
+  if (!cleanEmail || !cleanEmail.includes('@')) {
     return {
       authorized: false,
-      reason: 'Địa chỉ email không hợp lệ.'
+      reason: 'Địa chỉ email không hợp lệ. Vui lòng nhập đúng định dạng email (ví dụ: ten@gmail.com).'
     };
   }
 
@@ -566,34 +568,75 @@ export async function verifyTeacherAuthorization(email?: string | null): Promise
         toChuyenMon: 'Tổ Ban Giám Hiệu',
         subject: 'Tin học & Khoa học',
         avatar: '👨‍🏫',
-        teachingClasses: [],
+        teachingClasses: ['Lớp 4C', 'Lớp 4D'],
         homeroomClasses: []
       }
     };
   }
 
+  if (cleanEmail === 'dongtam79tk@gmail.com' || cleanEmail === 'dongtam@gmail.com') {
+    return {
+      authorized: true,
+      profile: {
+        id: 'gv-08',
+        name: 'Đồng Thị Tâm',
+        email: cleanEmail,
+        role: 'Giáo viên chủ nhiệm',
+        userRole: 'admin',
+        toChuyenMon: 'Tổ 4',
+        subject: 'Âm nhạc & Mĩ thuật',
+        avatar: '👩‍🏫',
+        homeroomClasses: ['Lớp 4D'],
+        teachingClasses: ['Lớp 4D']
+      }
+    };
+  }
+
+  const emailVariants = Array.from(new Set([cleanEmail, rawInput]));
+
   // 2. Query Firestore `teachers` collection
   if (db) {
     try {
-      const qTeachers = query(collection(db, 'teachers'), where('email', '==', cleanEmail));
+      const qTeachers = query(collection(db, 'teachers'), where('email', 'in', emailVariants));
       const snapTeachers = await getDocs(qTeachers);
+      let matchedDocData: any = null;
+      let matchedDocId = '';
+
       if (!snapTeachers.empty) {
-        const docSnap = snapTeachers.docs[0];
-        const data = docSnap.data() as TeacherRecord;
+        matchedDocData = snapTeachers.docs[0].data();
+        matchedDocId = snapTeachers.docs[0].id;
+      } else {
+        // Fallback case-insensitive check across teachers collection
+        const allTeachersSnap = await getDocs(collection(db, 'teachers'));
+        for (const d of allTeachersSnap.docs) {
+          const dData = d.data();
+          const dEmail = String(dData?.email || '').trim().toLowerCase();
+          if (dEmail === cleanEmail) {
+            matchedDocData = dData;
+            matchedDocId = d.id;
+            break;
+          }
+        }
+      }
+
+      if (matchedDocData) {
+        const data = matchedDocData as TeacherRecord;
         if (data.status === 'locked' || (data.status as string) === 'inactive') {
           return {
             authorized: false,
             reason: 'Tài khoản giáo viên này đang ở trạng thái tạm khóa. Vui lòng liên hệ quản trị viên.'
           };
         }
-        const isAdmin = (data.role || '').toLowerCase().includes('quản trị') ||
-                        (data.role || '').toLowerCase().includes('admin') ||
-                        (data.role || '').toLowerCase().includes('hiệu trưởng');
+        const isAdmin =
+          (data as any).userRole === 'admin' ||
+          (data.role || '').toLowerCase().includes('quản trị') ||
+          (data.role || '').toLowerCase().includes('admin') ||
+          (data.role || '').toLowerCase().includes('hiệu trưởng');
         return {
           authorized: true,
           profile: {
-            id: docSnap.id || data.id,
-            name: data.name,
+            id: matchedDocId || data.id || 'gv-01',
+            name: (data.name === 'Nguyễn Thị Thủ' && cleanEmail.includes('thuthuthtk')) ? 'Nguyễn Thị Thu' : (data.name || resolveTeacherNameByEmail(cleanEmail)),
             email: data.email || cleanEmail,
             role: data.role || (isAdmin ? 'Quản trị viên (ADMIN)' : 'Giáo viên bộ môn'),
             userRole: isAdmin ? 'admin' : 'teacher',
@@ -612,24 +655,28 @@ export async function verifyTeacherAuthorization(email?: string | null): Promise
 
     // 3. Query Firestore `users` collection
     try {
-      const qUsers = query(collection(db, 'users'), where('email', '==', cleanEmail));
+      const qUsers = query(collection(db, 'users'), where('email', 'in', emailVariants));
       const snapUsers = await getDocs(qUsers);
       if (!snapUsers.empty) {
         const docSnap = snapUsers.docs[0];
         const data = docSnap.data() as any;
-        if (data.status === 'inactive') {
+        if (data.status === 'inactive' || data.status === 'locked') {
           return {
             authorized: false,
             reason: 'Tài khoản này đang ở trạng thái tạm khóa. Vui lòng liên hệ quản trị viên.'
           };
         }
-        const isAdmin = (data.role || '').toLowerCase().includes('quản trị') ||
-                        (data.role || '').toLowerCase().includes('admin');
+        const isAdmin =
+          data.userRole === 'admin' ||
+          data.role === 'admin' ||
+          (data.role || '').toLowerCase().includes('quản trị') ||
+          (data.role || '').toLowerCase().includes('admin') ||
+          (data.role || '').toLowerCase().includes('hiệu trưởng');
         return {
           authorized: true,
           profile: {
-            id: docSnap.id || data.id,
-            name: data.name,
+            id: docSnap.id || data.id || 'gv-01',
+            name: data.name || data.displayName || resolveTeacherNameByEmail(cleanEmail),
             email: data.email || cleanEmail,
             role: data.role || (isAdmin ? 'Quản trị viên (ADMIN)' : 'Giáo viên bộ môn'),
             userRole: isAdmin ? 'admin' : 'teacher',
@@ -656,20 +703,22 @@ export async function verifyTeacherAuthorization(email?: string | null): Promise
             (t: any) => (t.email || '').toLowerCase().trim() === cleanEmail
           );
           if (matched) {
-            if (matched.status === 'inactive') {
+            if (matched.status === 'inactive' || matched.status === 'locked') {
               return {
                 authorized: false,
                 reason: 'Tài khoản giáo viên này đang ở trạng thái tạm khóa. Vui lòng liên hệ quản trị viên.'
               };
             }
-            const isAdmin = (matched.role || '').toLowerCase().includes('quản trị') ||
-                            (matched.role || '').toLowerCase().includes('admin') ||
-                            (matched.role || '').toLowerCase().includes('hiệu trưởng');
+            const isAdmin =
+              matched.userRole === 'admin' ||
+              (matched.role || '').toLowerCase().includes('quản trị') ||
+              (matched.role || '').toLowerCase().includes('admin') ||
+              (matched.role || '').toLowerCase().includes('hiệu trưởng');
             return {
               authorized: true,
               profile: {
                 id: matched.id || 'gv-whitelisted',
-                name: matched.name,
+                name: matched.name || resolveTeacherNameByEmail(cleanEmail),
                 email: matched.email || cleanEmail,
                 role: matched.role || (isAdmin ? 'Quản trị viên (ADMIN)' : 'Giáo viên bộ môn'),
                 userRole: isAdmin ? 'admin' : 'teacher',
@@ -689,11 +738,12 @@ export async function verifyTeacherAuthorization(email?: string | null): Promise
     }
   }
 
-  // 5. Query LocalStorage / initialTeachersList
-  const teachersList = getTeachersFromLocalStorage();
-  const matchedLocal = teachersList.find(
-    (t) => (t.email || '').toLowerCase().trim() === cleanEmail
-  );
+  // 5. Query LocalStorage / initialTeachersList / CANONICAL_TEACHER_DIRECTORY
+  const localTeachers = getTeachersFromLocalStorage();
+  const matchedLocal =
+    localTeachers.find((t) => (t.email || '').toLowerCase().trim() === cleanEmail) ||
+    initialTeachersList.find((t) => (t.email || '').toLowerCase().trim() === cleanEmail);
+
   if (matchedLocal) {
     if (matchedLocal.status === 'locked' || (matchedLocal.status as string) === 'inactive') {
       return {
@@ -701,14 +751,16 @@ export async function verifyTeacherAuthorization(email?: string | null): Promise
         reason: 'Tài khoản giáo viên này đang ở trạng thái tạm khóa. Vui lòng liên hệ quản trị viên.'
       };
     }
-    const isAdmin = (matchedLocal.role || '').toLowerCase().includes('quản trị') ||
-                    (matchedLocal.role || '').toLowerCase().includes('admin') ||
-                    (matchedLocal.role || '').toLowerCase().includes('hiệu trưởng');
+    const isAdmin =
+      (matchedLocal as any).userRole === 'admin' ||
+      (matchedLocal.role || '').toLowerCase().includes('quản trị') ||
+      (matchedLocal.role || '').toLowerCase().includes('admin') ||
+      (matchedLocal.role || '').toLowerCase().includes('hiệu trưởng');
     return {
       authorized: true,
       profile: {
         id: matchedLocal.id,
-        name: matchedLocal.name,
+        name: (matchedLocal.name === 'Nguyễn Thị Thủ' && cleanEmail.includes('thuthuthtk')) ? 'Nguyễn Thị Thu' : matchedLocal.name,
         email: matchedLocal.email || cleanEmail,
         role: matchedLocal.role || (isAdmin ? 'Quản trị viên (ADMIN)' : 'Giáo viên bộ môn'),
         userRole: isAdmin ? 'admin' : 'teacher',
@@ -722,10 +774,36 @@ export async function verifyTeacherAuthorization(email?: string | null): Promise
     };
   }
 
+  const matchedCanonical = CANONICAL_TEACHER_DIRECTORY.find((c) =>
+    Array.isArray(c.emails) && c.emails.some((em) => em.toLowerCase().trim() === cleanEmail)
+  );
+  if (matchedCanonical) {
+    const isAdmin =
+      matchedCanonical.userRole === 'admin' ||
+      (matchedCanonical.role || '').toLowerCase().includes('quản trị') ||
+      (matchedCanonical.role || '').toLowerCase().includes('admin') ||
+      (matchedCanonical.role || '').toLowerCase().includes('hiệu trưởng');
+    return {
+      authorized: true,
+      profile: {
+        id: matchedCanonical.id,
+        name: matchedCanonical.name,
+        email: cleanEmail,
+        role: matchedCanonical.role || (isAdmin ? 'Quản trị viên (ADMIN)' : 'Giáo viên bộ môn'),
+        userRole: isAdmin ? 'admin' : 'teacher',
+        toChuyenMon: matchedCanonical.toChuyenMon,
+        subject: matchedCanonical.subject,
+        avatar: matchedCanonical.avatar || '👩‍🏫',
+        homeroomClasses: matchedCanonical.homeroomClasses,
+        teachingClasses: matchedCanonical.teachingClasses
+      }
+    };
+  }
+
   // Not in whitelist
   return {
     authorized: false,
-    reason: 'Tài khoản Google này chưa được đăng ký trong hệ thống. Vui lòng liên hệ quản trị viên.'
+    reason: `Tài khoản (${cleanEmail}) chưa được đăng ký trong danh sách giáo viên của hệ thống. Vui lòng kiểm tra lại email hoặc liên hệ Quản trị viên.`
   };
 }
 
