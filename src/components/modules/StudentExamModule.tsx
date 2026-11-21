@@ -1816,6 +1816,7 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
                     ...fullExamRecord,
                     id: authenticStudentCode,
                     assignmentId: officialExamId,
+                    targetId: officialExamId,
                     attemptNumber,
                     updatedAt: new Date().toISOString()
                   }), { merge: true }),
@@ -1855,10 +1856,22 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
                 withFirestoreTimeout(
                   studentResultService.saveAssignmentResult(authenticStudentCode, {
                     assignmentId: officialExamId,
+                    targetId: officialExamId,
+                    originalAssignmentId: exam.originalExamId || null,
+                    title: exam.title || 'Bài tập',
+                    subject: exam.subject || 'Môn học',
+                    studentName: effectiveStudentName,
+                    studentClass: effectiveStudentClass,
                     score: scoreNumber,
+                    totalScore: scoreNumber,
                     maxScore: 10,
+                    correctCount: Math.round(correct),
+                    totalQuestions: totalQ,
                     submittedAt: nowTimeStr,
-                    answers
+                    submittedTime: nowTimeStr,
+                    answers,
+                    answersById,
+                    questionSnapshot: qSnapshot
                   }),
                   8000,
                   'timeoutSubmit.saveAsResult'
@@ -2475,7 +2488,9 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
           ...examSub,
           recordType: isAssignment ? ('assignment' as const) : ('exam' as const),
           id: fixedDocId,
+          targetId: officialExamId,
           assignmentId: isAssignment ? officialExamId : null,
+          originalAssignmentId: isAssignment ? (exam.originalExamId || null) : null,
           studentId: authenticStudentCode,
           attemptNumber,
           sddcn: session?.sddcn || authenticStudentCode,
@@ -2498,7 +2513,9 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
         const slimExamRecord = sanitizeForFirestore({
           id: fixedDocId,
           examId: officialExamId,
+          targetId: officialExamId,
           assignmentId: isAssignment ? officialExamId : null,
+          originalAssignmentId: isAssignment ? (exam.originalExamId || null) : null,
           studentId: authenticStudentCode,
           studentCode: authenticStudentCode,
           maHs: authenticStudentCode,
@@ -2821,15 +2838,72 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
               withFirestoreTimeout(
                 studentResultService.saveAssignmentResult(authenticStudentCode, {
                   assignmentId: officialExamId,
+                  targetId: officialExamId,
+                  originalAssignmentId: exam.originalExamId || null,
+                  title: exam.title || 'Bài tập',
+                  subject: exam.subject || 'Môn học',
+                  studentName: effectiveStudentName,
+                  studentClass: effectiveStudentClass,
                   score: scoreNumber,
+                  totalScore: scoreNumber,
                   maxScore: 10,
+                  correctCount: Math.round(correct),
+                  totalQuestions: totalQ,
                   submittedAt: nowTimeStr,
-                  answers
+                  submittedTime: nowTimeStr,
+                  answers,
+                  answersById,
+                  questionSnapshot: qSnapshot
                 }),
                 8000,
                 'sync.saveAssignmentResult'
               )
             );
+            if (exam.originalExamId && exam.originalExamId !== officialExamId) {
+              const origAsSubRef = doc(db, 'assignments', exam.originalExamId, 'submissions', authenticStudentCode);
+              secondarySyncTasks.push(
+                withFirestoreTimeout(
+                  setDoc(origAsSubRef, sanitizeForFirestore({
+                    ...fullExamRecord,
+                    id: authenticStudentCode,
+                    assignmentId: exam.originalExamId,
+                    targetId: exam.originalExamId,
+                    attemptNumber,
+                    updatedAt: new Date().toISOString()
+                  }), { merge: true }),
+                  8000,
+                  'sync.origAsSubDoc'
+                ),
+                withFirestoreTimeout(
+                  studentResultService.saveFullAssignmentSubmission(authenticStudentCode, exam.originalExamId, fullExamRecord),
+                  8000,
+                  'sync.origFullAssignment'
+                ),
+                withFirestoreTimeout(
+                  studentResultService.saveAssignmentResult(authenticStudentCode, {
+                    assignmentId: exam.originalExamId,
+                    targetId: exam.originalExamId,
+                    originalAssignmentId: exam.originalExamId,
+                    title: exam.title || 'Bài tập',
+                    subject: exam.subject || 'Môn học',
+                    studentName: effectiveStudentName,
+                    studentClass: effectiveStudentClass,
+                    score: scoreNumber,
+                    totalScore: scoreNumber,
+                    maxScore: 10,
+                    correctCount: Math.round(correct),
+                    totalQuestions: totalQ,
+                    submittedAt: nowTimeStr,
+                    submittedTime: nowTimeStr,
+                    answers,
+                    answersById,
+                    questionSnapshot: qSnapshot
+                  }),
+                  8000,
+                  'sync.origAssignmentResult'
+                )
+              );
+            }
           }
 
           await Promise.allSettled(secondarySyncTasks);

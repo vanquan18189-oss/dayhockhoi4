@@ -95,45 +95,61 @@ export interface StudentSubmissionDetailModalProps {
   onDeleteSubmission?: (studentIdentifier: string) => Promise<void> | void;
 }
 
+import { studentResultService, extractCleanStudentCode } from '../../services/studentResultService';
+
 /**
  * Trích xuất câu trả lời của học sinh cho một câu hỏi cụ thể theo ID hoặc Index
  */
 export function extractStudentAnswer(q: QuestionItem, qIdx: number, sub: any): any {
   if (!sub) return undefined;
   const rawSub = sub.rawSubmission || sub;
+  const lastAttempt = rawSub?.lastAttempt && typeof rawSub.lastAttempt === 'object' ? rawSub.lastAttempt : null;
 
   // 1. Ưu tiên đối chiếu theo question ID qua answersById
   if (rawSub.answersById && q.id && rawSub.answersById[q.id] !== undefined) {
     return rawSub.answersById[q.id];
   }
+  if (lastAttempt?.answersById && q.id && lastAttempt.answersById[q.id] !== undefined) {
+    return lastAttempt.answersById[q.id];
+  }
   if (sub.answersById && q.id && sub.answersById[q.id] !== undefined) {
     return sub.answersById[q.id];
   }
 
-  // 2. Đối chiếu theo answers object (keyed by question ID hoặc index)
-  const answersObj = rawSub.answers !== undefined ? rawSub.answers : sub.answers;
-  if (answersObj && typeof answersObj === 'object' && !Array.isArray(answersObj)) {
-    if (q.id && answersObj[q.id] !== undefined) {
-      return answersObj[q.id];
-    }
-    if (answersObj[qIdx] !== undefined) {
-      return answersObj[qIdx];
-    }
-    if (answersObj[String(qIdx)] !== undefined) {
-      return answersObj[String(qIdx)];
+  // 2. Đối chiếu theo answers object (keyed by question ID hoặc index) từ rawSub hoặc lastAttempt
+  const candidateAnswerSources = [
+    rawSub.answers,
+    lastAttempt?.answers,
+    rawSub.studentAnswers,
+    rawSub.choices,
+    sub.answers
+  ];
+
+  for (const answersObj of candidateAnswerSources) {
+    if (!answersObj) continue;
+    if (typeof answersObj === 'object' && !Array.isArray(answersObj)) {
+      if (q.id && answersObj[q.id] !== undefined) {
+        return answersObj[q.id];
+      }
+      if (answersObj[qIdx] !== undefined) {
+        return answersObj[qIdx];
+      }
+      if (answersObj[String(qIdx)] !== undefined) {
+        return answersObj[String(qIdx)];
+      }
+    } else if (Array.isArray(answersObj) && answersObj[qIdx] !== undefined) {
+      const val = answersObj[qIdx];
+      // Nếu là mảng ['pass', 'fail'] của bảng theo dõi thì tiếp tục tìm lựa chọn gốc trước
+      if (val !== 'pass' && val !== 'fail' && val !== 'none') {
+        return val;
+      }
     }
   }
 
-  // 3. Đối chiếu theo answers mảng theo vị trí
-  if (Array.isArray(answersObj) && answersObj[qIdx] !== undefined) {
-    return answersObj[qIdx];
-  }
-
-  // 4. Dự phòng qua studentAnswers hoặc choices
-  const alt = rawSub.studentAnswers || rawSub.choices;
-  if (alt && typeof alt === 'object') {
-    if (q.id && alt[q.id] !== undefined) return alt[q.id];
-    if (alt[qIdx] !== undefined) return alt[qIdx];
+  // Fallback cuối: nếu mảng chỉ lưu trạng thái pass/fail
+  const fallbackArr = rawSub.answers || lastAttempt?.answers || sub.answers;
+  if (Array.isArray(fallbackArr) && fallbackArr[qIdx] !== undefined && fallbackArr[qIdx] !== 'none') {
+    return fallbackArr[qIdx];
   }
 
   return undefined;
@@ -166,12 +182,14 @@ export const StudentSubmissionDetailModal: React.FC<StudentSubmissionDetailModal
                       studentSubmission?.rawSubmission?.studentName || 
                       'Học sinh';
 
-  const studentCode = studentSubmission?.studentCode || 
-                      studentSubmission?.maHs || 
-                      studentSubmission?.studentId || 
-                      studentSubmission?.code || 
-                      studentSubmission?.rawSubmission?.studentCode || 
-                      '';
+  const studentCode = extractCleanStudentCode(
+    studentSubmission?.rawSubmission || studentSubmission,
+    studentSubmission?.studentCode ||
+      studentSubmission?.maHs ||
+      studentSubmission?.code ||
+      studentSubmission?.studentId ||
+      ''
+  );
 
   const submittedTime = studentSubmission?.submittedTime || 
                         studentSubmission?.submittedAt || 
@@ -473,15 +491,28 @@ export const StudentSubmissionDetailModal: React.FC<StudentSubmissionDetailModal
         existingComment: rawSub?.generalComment || rawSub?.comment
       });
 
+      const preservedChoices =
+        rawSub?.answers && !Array.isArray(rawSub.answers) && Object.keys(rawSub.answers).length > 0
+          ? rawSub.answers
+          : rawSub?.lastAttempt?.answers && Object.keys(rawSub.lastAttempt.answers).length > 0
+          ? rawSub.lastAttempt.answers
+          : newAnswersArray;
+
       const updatedSubmissionPayload = {
         ...rawSub,
+        targetId: targetItem.id,
+        assignmentId: mode === 'assignment' ? targetItem.id : (rawSub?.assignmentId || null),
         studentId: studentCode,
         studentCode: studentCode,
         maHs: studentCode,
         studentName: studentName,
-        answers: newAnswersArray,
+        answers: preservedChoices,
+        questionResults: newAnswersArray,
+        gradedAnswers: newAnswersArray,
         totalScore: newScoreNumber,
         score: newScoreNumber,
+        correctCount: stats.correctCount,
+        totalQuestions: stats.totalCount,
         generalComment: ruleComment.fullComment,
         commentLevel: ruleComment.commentLevel,
         isManuallyEdited: rawSub?.isManuallyEdited || false,
@@ -512,7 +543,7 @@ export const StudentSubmissionDetailModal: React.FC<StudentSubmissionDetailModal
               const currentData = snap.data();
               const existingSubs = Array.isArray(currentData.submissions) ? [...currentData.submissions] : [];
               const filtered = existingSubs.filter((s: any) => 
-                (s.studentCode || s.maHs || s.studentId || s.code || '').toLowerCase() !== studentCode.toLowerCase()
+                extractCleanStudentCode(s) !== studentCode
               );
               filtered.unshift(updatedSubmissionPayload);
               transaction.update(masterDocRef, {
@@ -523,6 +554,35 @@ export const StudentSubmissionDetailModal: React.FC<StudentSubmissionDetailModal
           });
         } catch (tErr) {
           console.warn('Lỗi transaction master doc:', tErr);
+        }
+
+        // 3. Đồng bộ kết quả chấm lại vào student_results theo đúng studentCode
+        if (mode === 'assignment') {
+          try {
+            await Promise.allSettled([
+              studentResultService.saveFullAssignmentSubmission(studentCode, targetDocId, updatedSubmissionPayload),
+              studentResultService.saveAssignmentResult(studentCode, {
+                assignmentId: targetDocId,
+                targetId: targetDocId,
+                originalAssignmentId: targetItem.originalAssignmentId || null,
+                title: targetItem.title,
+                subject: targetItem.subject,
+                studentName,
+                studentClass: targetItem.targetClass || '',
+                score: newScoreNumber,
+                totalScore: newScoreNumber,
+                maxScore: 10,
+                correctCount: stats.correctCount,
+                totalQuestions: stats.totalCount,
+                submittedAt: submittedTime,
+                submittedTime,
+                answers: preservedChoices,
+                answersById: rawSub?.answersById || {}
+              })
+            ]);
+          } catch (srErr) {
+            console.warn('Lỗi đồng bộ student_results khi chấm lại:', srErr);
+          }
         }
       }
 

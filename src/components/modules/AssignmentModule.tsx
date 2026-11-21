@@ -62,11 +62,11 @@ import { ConfirmDeleteModal } from '../common/ConfirmDeleteModal';
 import { getLocalCachedQuestions, QUESTIONS_CACHE_KEY, saveQuestionsBatchToFirestore } from '../../services/questionStorageService';
 import { useScoreSort } from '../../lib/useScoreSort';
 import { StudentAssignmentModule } from './StudentAssignmentModule';
-import { studentResultService } from '../../services/studentResultService';
+import { studentResultService, extractCleanStudentCode, getCandidateAssignmentIds, isMatchingStudentCode } from '../../services/studentResultService';
 import { resetOrDeleteStudentAssignmentSubmission } from '../../services/studentSubmissionResetService';
 import { syncAssignmentQuestions } from '../../services/assignmentSyncService';
 import { getCurrentTeacherProfile, resolveCurrentTeacherProfile } from '../../services/teacherStorageService';
-import { getStudentsFromLocalStorage, getClassStudentCount, generateDefaultClassRoster } from '../../services/studentStorageService';
+import { getStudentsFromLocalStorage, getClassStudentCount, generateDefaultClassRoster, fetchClassStudentsFromFirestore } from '../../services/studentStorageService';
 import { auth, db } from '../../services/firebase';
 import { doc, onSnapshot, getDoc, setDoc, collection, getDocs, deleteDoc, runTransaction } from 'firebase/firestore';
 import { trackedSetDoc } from '../../services/firestoreWriteTracker';
@@ -295,8 +295,14 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
           if (docs.length > 0) {
             setLiveSubmissions(prev => {
               const map = new Map<string, any>();
-              prev.forEach((s: any) => map.set(s.id || s.studentId || s.studentCode || s.maHs, s));
-              docs.forEach((s: any) => map.set(s.id || s.studentId || s.studentCode || s.maHs, s));
+              prev.forEach((s: any) => {
+                const k = extractCleanStudentCode(s, s?.id);
+                if (k) map.set(k, s);
+              });
+              docs.forEach((s: any) => {
+                const k = extractCleanStudentCode(s, s?.id);
+                if (k) map.set(k, s);
+              });
               return Array.from(map.values());
             });
             setSubmissionSyncTick(t => t + 1);
@@ -320,114 +326,37 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
     };
   }, [detailAssignment?.id]);
 
-  // Comprehensive manual/automatic submission sync function (Read-only, no Firestore write)
+  // Comprehensive manual/automatic submission sync function (Read-only, strictly keyed by studentCode)
   const handleSyncSubmissions = useCallback(async (showToastNotice = true) => {
     if (!detailAssignment?.id) return;
     setIsSyncingSubmissions(true);
     try {
-      const mergedSubsMap = new Map<string, any>();
+      const targetClass = detailAssignment.targetClass || 'Lớp 4C';
 
-      // 1. Existing submissions on detailAssignment
-      if (Array.isArray(detailAssignment.submissions)) {
-        detailAssignment.submissions.forEach((s: any) => {
-          const key = s.studentId || s.studentCode || s.maHs || s.id;
-          if (key) mergedSubsMap.set(String(key).toLowerCase(), s);
-        });
-      }
-
-      // 2. Query Firestore subcollection: assignments/{id}/submissions
-      if (db) {
-        try {
-          const subsCollRef = collection(db, 'assignments', detailAssignment.id, 'submissions');
-          const subsSnap = await getDocs(subsCollRef);
-          subsSnap.docs.forEach(docSnap => {
-            const data = { id: docSnap.id, ...docSnap.data() };
-            const key = (data as any).studentId || (data as any).studentCode || (data as any).maHs || docSnap.id;
-            if (key) mergedSubsMap.set(String(key).toLowerCase(), data);
-          });
-        } catch (err) {
-          console.warn('Không thể đọc subcollection submissions:', err);
+      // 1. Đồng bộ danh sách học sinh của lớp từ Firestore (nếu có) để hiển thị tên học sinh tương ứng mã
+      try {
+        const localRoster = getStudentsFromLocalStorage(targetClass);
+        if (!localRoster || localRoster.length === 0) {
+          await fetchClassStudentsFromFirestore(targetClass);
         }
-
-        // Also fetch fresh assignment doc to see if submissions array was updated
-        try {
-          const assignDocRef = doc(db, 'assignments', detailAssignment.id);
-          const assignSnap = await getDoc(assignDocRef);
-          if (assignSnap.exists()) {
-            const assignData = assignSnap.data() as HomeworkAssignment;
-            if (Array.isArray(assignData.submissions)) {
-              assignData.submissions.forEach((s: any) => {
-                const key = s.studentId || s.studentCode || s.maHs || s.id;
-                if (key) mergedSubsMap.set(String(key).toLowerCase(), s);
-              });
-            }
-          }
-        } catch (err) {
-          console.warn('Không thể đọc assignment doc:', err);
-        }
+      } catch (rosterErr) {
+        console.warn('Không thể tải danh sách lớp từ Firestore:', rosterErr);
       }
 
-      // 3. Scan localStorage for student submissions
-      if (typeof window !== 'undefined') {
-        const targetClass = detailAssignment.targetClass || 'Lớp 4A';
-        const classStudents = getStudentsFromLocalStorage(targetClass) || [];
-        classStudents.forEach(st => {
-          const keys = [st.code, st.id, st.username].filter(Boolean) as string[];
-          keys.forEach(k => {
-            try {
-              const raw = localStorage.getItem(`eduplay_k4_student_submissions_${k}`);
-              if (raw) {
-                const parsed = JSON.parse(raw);
-                if (Array.isArray(parsed)) {
-                  const m = parsed.find((item: any) =>
-                    item.assignment?.id === detailAssignment.id ||
-                    item.id === detailAssignment.id ||
-                    item.assignmentId === detailAssignment.id ||
-                    (item.title && item.title === detailAssignment.title)
-                  );
-                  if (m) {
-                    mergedSubsMap.set(String(st.code).toLowerCase(), {
-                      id: m.id || `sub-${st.code}`,
-                      studentId: st.code,
-                      studentCode: st.code,
-                      maHs: st.code,
-                      studentName: st.fullName || st.name,
-                      score: m.score !== undefined ? m.score : (m.totalScore !== undefined ? m.totalScore : '-'),
-                      totalScore: m.totalScore !== undefined ? m.totalScore : (m.score !== undefined ? m.score : '-'),
-                      submittedAt: m.submittedTime || m.submittedAt || new Date().toLocaleString('vi-VN'),
-                      submittedTime: m.submittedTime || m.submittedAt || new Date().toLocaleString('vi-VN'),
-                      answers: m.answers || [],
-                      status: 'submitted'
-                    });
-                  }
-                }
-              }
-            } catch {}
-          });
-        });
+      // 2. Truy vấn toàn bộ bài làm từ student_results, assignments/{id}/submissions, assignments/{id} & LocalStorage
+      // Đối chiếu DUY NHẤT theo Mã học sinh (studentCode viết hoa, trim khoảng trắng)
+      const allMerged = await studentResultService.fetchAssignmentSubmissionsByStudentCode(detailAssignment);
 
-        // Also check eduplay_all_exam_submissions & eduplay_exam_subs_{id}
-        try {
-          const rawExamSubs = localStorage.getItem(`eduplay_k4_exam_subs_${detailAssignment.id}`);
-          if (rawExamSubs) {
-            const parsed = JSON.parse(rawExamSubs);
-            if (Array.isArray(parsed)) {
-              parsed.forEach((s: any) => {
-                const sCode = s.studentId || s.studentCode || s.maHs;
-                if (sCode) {
-                  mergedSubsMap.set(String(sCode).toLowerCase(), {
-                    ...s,
-                    status: 'submitted'
-                  });
-                }
-              });
-            }
-          }
-        } catch {}
-      }
-
-      const allMerged = Array.from(mergedSubsMap.values());
       setLiveSubmissions(allMerged);
+      setDetailAssignment(prev => {
+        if (!prev || prev.id !== detailAssignment.id) return prev;
+        return {
+          ...prev,
+          submissions: allMerged,
+          submittedCount: allMerged.length,
+          completedCount: allMerged.length
+        };
+      });
       setSubmissionSyncTick(prev => prev + 1);
 
       if (showToastNotice) {
@@ -457,8 +386,13 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
       setSubmissionSyncTick(prev => prev + 1);
     };
     window.addEventListener('eduplay_student_submissions_updated', handleSubmissionsUpdated);
+    window.addEventListener('student-data-updated', handleSubmissionsUpdated);
+    window.addEventListener('eduplay_students_updated', handleSubmissionsUpdated);
     window.addEventListener('storage', handleSubmissionsUpdated);
     return () => {
+      window.removeEventListener('eduplay_student_submissions_updated', handleSubmissionsUpdated);
+      window.removeEventListener('student-data-updated', handleSubmissionsUpdated);
+      window.removeEventListener('eduplay_students_updated', handleSubmissionsUpdated);
       window.removeEventListener('storage', handleSubmissionsUpdated);
     };
   }, []);
@@ -473,11 +407,22 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
       return;
     }
 
-    const targetCode = deleteTarget.code;
-    const targetName = deleteTarget.name;
+    const rawCode = String(deleteTarget.code || '').trim();
+    const targetCode = (
+      extractCleanStudentCode({ studentCode: rawCode }, rawCode) ||
+      normalizeStudentCode(rawCode)
+    )
+      .trim()
+      .toUpperCase();
+    const targetName = deleteTarget.name || targetCode;
     const assignmentId = detailAssignment.id;
 
-    console.log(`[Delete Submission Start] Deleting assignment submission: StudentName="${targetName}", StudentCode="${targetCode}", AssignmentId="${assignmentId}"`);
+    if (!targetCode) {
+      setDeleteError('Mã học sinh không hợp lệ để xóa kết quả.');
+      return;
+    }
+
+    console.log(`[Delete Submission Start] Deleting assignment submission strictly by studentCode="${targetCode}", AssignmentId="${assignmentId}"`);
 
     setIsDeletingSubmission(true);
     setDeleteError(null);
@@ -489,434 +434,515 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
         studentId: targetCode,
         assignmentId: assignmentId,
         originalAssignmentId: detailAssignment.originalAssignmentId,
-        targetClass: detailAssignment.targetClass
+        targetClass: detailAssignment.targetClass,
+        title: detailAssignment.title
       });
 
-      console.log(`[Delete Submission Success] Resetted/deleted submission for ${targetName} (${targetCode}):`, result);
+      console.log(`[Delete Submission Success] Resetted/deleted submission for ${targetCode}:`, result);
 
-      // 1. Immediately remove student's submission from liveSubmissions state
-      setLiveSubmissions(prev => prev.filter((s: any) => {
-        const code = normalizeStudentCode(s.studentCode || s.code || s.maHs || s.studentId || s.id || '');
-        return code !== normalizeStudentCode(targetCode);
-      }));
+      // 1. Ngay lập tức cập nhật state danh sách kết quả liveSubmissions trên UI theo studentCode
+      setLiveSubmissions(prev =>
+        prev.filter((s: any) => !isMatchingStudentCode(targetCode, s, s?.id))
+      );
 
-      // 2. Update detailAssignment.submissions locally so tracking list re-evaluates
-      setDetailAssignment(prev => {
+      // 2. Cập nhật detailAssignment.submissions và submittedIds ngay lập tức mà không cần tải lại trang
+      const currentSubs = Array.isArray(detailAssignment.submissions) ? detailAssignment.submissions : [];
+      const updatedSubs = currentSubs.filter(
+        (s: any) => !isMatchingStudentCode(targetCode, s, s?.id)
+      );
+      const currentSubmittedIds = Array.isArray(detailAssignment.submittedIds) ? detailAssignment.submittedIds : [];
+      const updatedSubmittedIds = currentSubmittedIds.filter(
+        (id: string) => !isMatchingStudentCode(targetCode, { studentCode: id }, id)
+      );
+
+      const updatedAssignment: HomeworkAssignment = {
+        ...detailAssignment,
+        submissions: updatedSubs,
+        submittedIds: updatedSubmittedIds,
+        submittedCount: Math.max(0, updatedSubs.length),
+        completedCount: Math.max(0, updatedSubs.length)
+      };
+
+      setDetailAssignment(updatedAssignment);
+
+      // 3. Đồng bộ lên state bài tập của ứng dụng cha
+      try {
+        onSaveAssignment(updatedAssignment);
+      } catch (saveErr) {
+        console.warn('Lỗi cập nhật state bài tập cha sau khi xóa bài nộp:', saveErr);
+      }
+
+      // 4. Nếu đang mở modal xem chi tiết bài làm của chính học sinh vừa xóa thì đóng lại
+      setSelectedStudentDetail(prev => {
         if (!prev) return null;
-        const subs = Array.isArray(prev.submissions) ? prev.submissions : [];
-        const updatedSubs = subs.filter((s: any) => {
-          const code = normalizeStudentCode(s.studentCode || s.code || s.maHs || s.studentId || s.id || '');
-          return code !== normalizeStudentCode(targetCode);
-        });
-        return {
-          ...prev,
-          submissions: updatedSubs,
-          submittedCount: Math.max(0, updatedSubs.length),
-          completedCount: Math.max(0, updatedSubs.length)
-        };
+        return isMatchingStudentCode(targetCode, { studentCode: prev.code }, prev.code) ? null : prev;
       });
 
-      // 3. Force submissionSyncTick increment to trigger recalculation of trackingStudentsList
+      // 5. Tăng tick để tính toán lại bảng Theo dõi nộp bài ngay lập tức
       setSubmissionSyncTick(tick => tick + 1);
 
-      // 4. Also call handleSyncSubmissions to ensure complete state sync
-      await handleSyncSubmissions(false);
-
-      // 5. Show Toast notification on UI
-      showToast(`Đã xóa kết quả bài làm của ${targetName}`);
-
-      // 6. Close the delete target modal
+      // 6. Đóng hộp thoại xác nhận xóa và hiển thị thông báo thành công thân thiện
       setDeleteTarget(null);
+      showToast(`✅ Đã xóa kết quả bài làm của mã học sinh ${targetCode} (${targetName})`);
     } catch (err: any) {
-      console.error(`[Delete Submission Error] Lỗi khi xóa kết quả bài làm của ${targetName} (${targetCode}):`, err);
+      console.error(`[Delete Submission Error] Lỗi khi xóa kết quả bài làm của ${targetCode}:`, err);
       setDeleteError(err?.message || 'Không thể xóa kết quả bài làm. Vui lòng kiểm tra lại kết nối mạng!');
+      showToast('⚠️ Không thể xóa kết quả bài làm. Vui lòng thử lại.');
     } finally {
       setIsDeletingSubmission(false);
     }
   };
 
-  // Helper calculating authentic unique submitted student count
+  // Helper calculating authentic unique submitted student count strictly by studentCode
   const getAssignmentSubmissionCount = useCallback((as: HomeworkAssignment): number => {
     if (!as) return 0;
-    const uniqueStudentKeys = new Set<string>();
+    const uniqueStudentCodes = new Set<string>();
 
-    const addSubKey = (s: any) => {
-      if (!s) return;
-      const k = (s.studentCode || s.maHs || s.studentId || s.code || '').trim().toLowerCase();
-      if (k) uniqueStudentKeys.add(k);
+    const addSubKey = (s: any, fallbackId?: string) => {
+      if (!s && !fallbackId) return;
+      const code = extractCleanStudentCode(s, fallbackId);
+      if (code) uniqueStudentCodes.add(code);
     };
 
     // 1. as.submissions
     const subs = Array.isArray(as.submissions) ? as.submissions : [];
-    subs.forEach(addSubKey);
+    subs.forEach(s => addSubKey(s));
 
     // 2. submittedIds
     if (Array.isArray(as.submittedIds)) {
       as.submittedIds.forEach((id: string) => {
-        if (id) uniqueStudentKeys.add(id.trim().toLowerCase());
+        if (id) addSubKey({ studentCode: id }, id);
       });
     }
 
     // 3. If this is detailAssignment, include liveSubmissions
     if (detailAssignment && detailAssignment.id === as.id && Array.isArray(liveSubmissions)) {
-      liveSubmissions.forEach(addSubKey);
+      liveSubmissions.forEach(s => addSubKey(s));
     }
 
-    // 4. Scan localStorage for students in targetClass
-    if (typeof window !== 'undefined' && as.targetClass) {
-      const roster = getStudentsFromLocalStorage(as.targetClass) || [];
-      roster.forEach(st => {
-        const keys = [st.code, st.id, st.username].filter(Boolean) as string[];
-        keys.forEach(k => {
-          try {
-            const raw = localStorage.getItem(`eduplay_k4_student_submissions_${k}`);
-            if (raw) {
-              const parsed = JSON.parse(raw);
-              if (Array.isArray(parsed)) {
-                const matched = parsed.find((item: any) =>
-                  item.assignment?.id === as.id ||
-                  item.id === as.id ||
-                  item.assignmentId === as.id ||
-                  (item.title && item.title === as.title)
-                );
-                if (matched) {
-                  addSubKey({ studentId: st.code, studentName: st.fullName || st.name });
-                }
-              }
-            }
-          } catch {}
-        });
-      });
-
-      // Also check eduplay_exam_subs_{as.id}
+    // 4. Scan localStorage for any submissions matching this assignment
+    if (typeof window !== 'undefined') {
+      const candIds = new Set(getCandidateAssignmentIds(as));
       try {
-        const rawExamSubs = localStorage.getItem(`eduplay_k4_exam_subs_${as.id}`);
-        if (rawExamSubs) {
-          const parsed = JSON.parse(rawExamSubs);
-          if (Array.isArray(parsed)) {
-            parsed.forEach(addSubKey);
+        for (const cid of candIds) {
+          const rawExamSubs = localStorage.getItem(`eduplay_k4_exam_subs_${cid}`);
+          if (rawExamSubs) {
+            const parsed = JSON.parse(rawExamSubs);
+            if (Array.isArray(parsed)) {
+              parsed.forEach(s => addSubKey(s));
+            }
           }
         }
       } catch {}
     }
 
-    if (uniqueStudentKeys.size > 0) return uniqueStudentKeys.size;
+    if (uniqueStudentCodes.size > 0) return uniqueStudentCodes.size;
     if (typeof as.submittedCount === 'number' && as.submittedCount > 0) return as.submittedCount;
     if (typeof as.completedCount === 'number' && as.completedCount > 0) return as.completedCount;
     return 0;
   }, [detailAssignment, liveSubmissions, submissionSyncTick]);
 
   // Dynamic tracking students derived from detailAssignment submissions and class roster
+  // LƯU VÀ ĐỐI CHIẾU DUY NHẤT THEO MÃ HỌC SINH (studentCode viết hoa, trim khoảng trắng), TUYỆT ĐỐI KHÔNG SO KHỚP TÊN HỌC SINH
   const trackingStudentsList = useMemo(() => {
     if (!detailAssignment) return [];
-    
-    // Debug log as requested by user
-    console.log("Current Assignment ID querying:", detailAssignment.id);
 
-    // Get authentic class students roster or default fallback
-    const targetClassName = detailAssignment.targetClass || 'Lớp 4A';
+    const targetClassName = detailAssignment.targetClass || 'Lớp 4C';
     const classStudentsRoster = getStudentsFromLocalStorage(targetClassName) || [];
-    
+
+    // Lập bản đồ danh sách lớp theo Mã học sinh chuẩn hóa (uppercase, trim) để lấy tên hiển thị nếu có
+    const rosterByCode = new Map<string, any>();
+    classStudentsRoster.forEach(st => {
+      const normRosterCode = extractCleanStudentCode({ studentCode: st.code || st.id }, st.code || st.id);
+      if (normRosterCode && !rosterByCode.has(normRosterCode)) {
+        rosterByCode.set(normRosterCode, st);
+      }
+      const stdFormatted = formatStandardStudentCode(st.code || st.id || '', targetClassName);
+      if (stdFormatted) {
+        const normStd = normalizeStudentCode(stdFormatted);
+        if (normStd && !rosterByCode.has(normStd)) {
+          rosterByCode.set(normStd, st);
+        }
+      }
+    });
+
     const subList: any[] = [
       ...(Array.isArray(detailAssignment.submissions) ? detailAssignment.submissions : []),
       ...liveSubmissions
     ];
+
+    // Map bài làm DUY NHẤT theo Mã học sinh (studentCode viết hoa, trim khoảng trắng)
     const subMap = new Map<string, any>();
 
-    const indexSubmission = (sub: any) => {
+    const indexSubmissionByCode = (sub: any, fallbackCode?: string) => {
       if (!sub) return;
-      const candidates = [
-        sub.studentId,
-        sub.maHs,
-        sub.studentCode,
-        sub.code,
-        sub.username,
-        sub.userId,
-        sub.id,
-        sub.studentName,
-        sub.name,
-        sub.fullName
-      ];
+      const normCode = extractCleanStudentCode(sub, fallbackCode);
+      if (!normCode) return;
 
-      candidates.forEach(cand => {
-        if (cand && typeof cand === 'string') {
-          const raw = cand.trim().toLowerCase();
-          if (raw) {
-            subMap.set(raw, sub);
-            // Normalized key (remove "st-", "hs-", "user-", accents/dashes/spaces)
-            const clean = raw.replace(/^(st|hs|user|u)[\-_]?/i, '').replace(/[\s\-_]/g, '');
-            if (clean) subMap.set(clean, sub);
+      const existing = subMap.get(normCode);
+      if (!existing) {
+        subMap.set(normCode, { ...sub, studentCode: normCode });
+      } else {
+        // Ưu tiên bản ghi có dữ liệu câu trả lời chi tiết (answers) đầy đủ hơn
+        const existingAns = existing.answers || existing.lastAttempt?.answers || {};
+        const newAns = sub.answers || sub.lastAttempt?.answers || {};
+        const existingCount = typeof existingAns === 'object' && existingAns !== null ? Object.keys(existingAns).length : 0;
+        const newCount = typeof newAns === 'object' && newAns !== null ? Object.keys(newAns).length : 0;
 
-            const stdCode = normalizeStudentCode(cand);
-            if (stdCode) {
-              subMap.set(stdCode, sub);
-              subMap.set(stdCode.toLowerCase(), sub);
-              const cleanStd = stdCode.toLowerCase().replace(/[\s\-_]/g, '');
-              if (cleanStd) subMap.set(cleanStd, sub);
-            }
-
-            const formatted = formatStandardStudentCode(cand, targetClassName);
-            if (formatted) {
-              subMap.set(formatted, sub);
-              subMap.set(formatted.toLowerCase(), sub);
-            }
-          }
+        if (newCount >= existingCount) {
+          subMap.set(normCode, {
+            ...existing,
+            ...sub,
+            studentCode: normCode,
+            answers: newCount > 0 ? newAns : existingAns
+          });
+        } else {
+          subMap.set(normCode, {
+            ...sub,
+            ...existing,
+            studentCode: normCode,
+            answers: existingAns
+          });
         }
-      });
+      }
 
-      const sName = sub.studentName || sub.name || sub.fullName;
-      if (sName && typeof sName === 'string') {
-        const normName = normalizeStudentName(sName);
-        if (normName) subMap.set(normName, sub);
-        subMap.set(sName.trim().toLowerCase(), sub);
+      // Cũng ánh xạ thêm mã chuẩn hóa theo lớp nếu có
+      const stdFormatted = formatStandardStudentCode(normCode, targetClassName);
+      if (stdFormatted) {
+        const normStd = normalizeStudentCode(stdFormatted);
+        if (normStd && !subMap.has(normStd)) {
+          subMap.set(normStd, subMap.get(normCode));
+        }
       }
     };
 
-    // Index all existing submissions on detailAssignment and liveSubmissions
-    subList.forEach(sub => indexSubmission(sub));
+    subList.forEach(sub => indexSubmissionByCode(sub));
 
-    // Also scan localStorage for submissions of each student in this class
+    // Quét thêm LocalStorage theo mọi khóa bài nộp (không phụ thuộc vào việc danh sách lớp có học sinh hay chưa)
     if (typeof window !== 'undefined') {
-      classStudentsRoster.forEach(st => {
-        const storageKeysToCheck = [
-          st.code,
-          st.id,
-          st.username,
-          st.code?.toLowerCase(),
-          st.id?.toLowerCase()
-        ].filter(Boolean) as string[];
+      const candIds = new Set(getCandidateAssignmentIds(detailAssignment));
+      const normTitle = (detailAssignment.title || '').trim().toLowerCase();
 
-        for (const sk of storageKeysToCheck) {
-          try {
-            const raw = localStorage.getItem(`eduplay_k4_student_submissions_${sk}`);
-            if (raw) {
+      try {
+        for (const cid of candIds) {
+          const rawExamSubs = localStorage.getItem(`eduplay_k4_exam_subs_${cid}`);
+          if (rawExamSubs) {
+            const parsed = JSON.parse(rawExamSubs);
+            if (Array.isArray(parsed)) {
+              parsed.forEach((s: any) => indexSubmissionByCode(s));
+            }
+          }
+        }
+
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (!k) continue;
+          if (
+            k.startsWith('eduplay_k4_student_submissions_') ||
+            k.startsWith('eduplay_k4_student_exam_subs_')
+          ) {
+            const keyCode = k
+              .replace(/^eduplay_k4_student_submissions_/, '')
+              .replace(/^eduplay_k4_student_exam_subs_/, '')
+              .trim();
+            const raw = localStorage.getItem(k);
+            if (!raw) continue;
+            try {
               const parsed = JSON.parse(raw);
               if (Array.isArray(parsed)) {
-                const matched = parsed.find((item: any) => 
-                  item.assignment?.id === detailAssignment.id ||
-                  item.id === detailAssignment.id ||
-                  item.assignmentId === detailAssignment.id ||
-                  (item.title && item.title === detailAssignment.title)
-                );
+                const matched = parsed.find((item: any) => {
+                  const itemAssignId = String(
+                    item?.assignmentId || item?.targetId || item?.assignment?.id || item?.examId || item?.exam?.id || item?.id || ''
+                  ).trim();
+                  const itemRoot = itemAssignId.replace(/-class-.*$/i, '').trim();
+                  const itemTitle = String(item?.title || item?.assignment?.title || '').trim().toLowerCase();
+                  return (
+                    candIds.has(itemAssignId) ||
+                    (itemRoot && candIds.has(itemRoot)) ||
+                    (normTitle && itemTitle && itemTitle === normTitle)
+                  );
+                });
                 if (matched) {
-                  const localSub = {
-                    id: matched.id || `sub-${st.code}`,
-                    studentId: st.code,
-                    studentCode: st.code,
-                    maHs: st.code,
-                    studentName: st.fullName || st.name,
-                    score: matched.score !== undefined ? matched.score : (matched.totalScore !== undefined ? matched.totalScore : '-'),
-                    totalScore: matched.totalScore !== undefined ? matched.totalScore : (matched.score !== undefined ? matched.score : '-'),
-                    submittedAt: matched.submittedTime || matched.submittedAt || new Date().toLocaleString('vi-VN'),
-                    submittedTime: matched.submittedTime || matched.submittedAt || new Date().toLocaleString('vi-VN'),
-                    answers: matched.answers || [],
-                    status: 'submitted'
-                  };
-                  indexSubmission(localSub);
-                  break;
+                  indexSubmissionByCode(matched, keyCode);
                 }
               }
-            }
-          } catch {}
+            } catch {}
+          }
         }
-      });
+      } catch {}
     }
 
     const questions = detailAssignment.questions || [];
     const questionCount = questions.length > 0 ? questions.length : 5;
 
-    const resultList = classStudentsRoster.map((st, idx) => {
-      const lookupKeys = [
-        st.code,
-        st.id,
-        st.username,
-        normalizeStudentCode(st.code),
-        normalizeStudentCode(st.id),
-        formatStandardStudentCode(st.code, targetClassName),
-        formatStandardStudentCode(st.id, targetClassName),
-        st.code?.toLowerCase(),
-        st.id?.toLowerCase(),
-        st.username?.toLowerCase(),
-        st.id?.replace(/^(st|hs|user|u)[\-_]?/i, '').replace(/[\s\-_]/g, ''),
-        st.code?.toLowerCase().replace(/[\s\-_]/g, ''),
-        st.id?.toLowerCase().replace(/[\s\-_]/g, ''),
-        normalizeStudentName(st.fullName || st.name),
-        st.fullName?.trim().toLowerCase(),
-        st.name?.trim().toLowerCase(),
-      ].filter(Boolean) as string[];
+    const buildSubmittedStudentRow = (
+      stCode: string,
+      stName: string,
+      submission: any
+    ): StudentSubmissionRow => {
+      const rawAnswers =
+        submission.answers !== undefined && submission.answers !== null && Object.keys(submission.answers).length > 0
+          ? submission.answers
+          : submission.lastAttempt?.answers !== undefined
+          ? submission.lastAttempt.answers
+          : submission.studentAnswers !== undefined
+          ? submission.studentAnswers
+          : submission.answersById;
 
-      let submission: any = null;
-      for (const k of lookupKeys) {
-        if (subMap.has(k)) {
-          submission = subMap.get(k);
-          break;
+      const subQuestions =
+        questions.length > 0
+          ? questions
+          : Array.isArray(submission.questionSnapshot) && submission.questionSnapshot.length > 0
+          ? submission.questionSnapshot
+          : Array.isArray(submission.assignment?.questions) && submission.assignment.questions.length > 0
+          ? submission.assignment.questions
+          : Array.isArray(submission.exam?.questions)
+          ? submission.exam.questions
+          : [];
+
+      const hasAnyAnswerKeys =
+        (Array.isArray(rawAnswers) && rawAnswers.length > 0) ||
+        (rawAnswers && typeof rawAnswers === 'object' && Object.keys(rawAnswers).length > 0) ||
+        (submission.answersById && typeof submission.answersById === 'object' && Object.keys(submission.answersById).length > 0);
+
+      const rawScore =
+        submission.score !== undefined && submission.score !== null && submission.score !== '-'
+          ? submission.score
+          : submission.totalScore !== undefined && submission.totalScore !== null && submission.totalScore !== '-'
+          ? submission.totalScore
+          : submission.lastAttempt?.score !== undefined
+          ? submission.lastAttempt.score
+          : '-';
+
+      const parsedRawScoreNum =
+        typeof rawScore === 'number'
+          ? rawScore
+          : typeof rawScore === 'string'
+          ? parseFloat(rawScore.replace(/\s*\/.*$/, '').trim())
+          : NaN;
+
+      const evaluatedAnswers: ('pass' | 'fail' | 'none')[] = Array.from({ length: questionCount }).map((_, qi) => {
+        const q = subQuestions[qi];
+        let rawChoice: any = undefined;
+        if (Array.isArray(rawAnswers)) {
+          rawChoice = rawAnswers[qi];
+        } else if (rawAnswers && typeof rawAnswers === 'object') {
+          rawChoice =
+            rawAnswers[qi] !== undefined
+              ? rawAnswers[qi]
+              : rawAnswers[String(qi)] !== undefined
+              ? rawAnswers[String(qi)]
+              : q?.id
+              ? rawAnswers[q.id]
+              : undefined;
         }
+        if (rawChoice === undefined && submission.answersById && q?.id) {
+          rawChoice = submission.answersById[q.id];
+        }
+        if (rawChoice === undefined && submission.lastAttempt?.answersById && q?.id) {
+          rawChoice = submission.lastAttempt.answersById[q.id];
+        }
+
+        // 1. Direct pass / fail values
+        if (rawChoice === 'pass' || rawChoice === true || rawChoice === 'correct') return 'pass';
+        if (rawChoice === 'fail' || rawChoice === false || rawChoice === 'incorrect') return 'fail';
+
+        // 2. Pre-evaluated questionResults if present
+        const preEvaluated = submission.questionResults || submission.results || submission.gradedAnswers;
+        if (Array.isArray(preEvaluated) && preEvaluated[qi] !== undefined) {
+          const p = preEvaluated[qi];
+          if (typeof p === 'boolean') return p ? 'pass' : 'fail';
+          if (p === 'pass' || p === 'fail') return p;
+          if (p && typeof p === 'object' && p.isCorrect !== undefined) return p.isCorrect ? 'pass' : 'fail';
+        }
+
+        // 3. Question-level evaluation via checkQuestionCorrectLocal
+        if (q && rawChoice !== undefined && rawChoice !== null && rawChoice !== '') {
+          try {
+            return checkQuestionCorrectLocal(q, rawChoice) ? 'pass' : 'fail';
+          } catch (err) {
+            console.warn(`Lỗi chấm điểm câu ${qi}:`, err);
+          }
+        }
+
+        // 4. Nếu bản ghi chỉ lưu tổng điểm (không lưu chi tiết từng câu) thì suy luận số câu đúng tương ứng với điểm số
+        if (!hasAnyAnswerKeys && Number.isFinite(parsedRawScoreNum) && parsedRawScoreNum > 0) {
+          const inferredCorrect = Math.round((parsedRawScoreNum / 10) * questionCount);
+          return qi < inferredCorrect ? 'pass' : 'fail';
+        }
+
+        return 'fail';
+      });
+
+      const correctCount = evaluatedAnswers.filter(a => a === 'pass').length;
+      const computedScore = questionCount > 0 ? Math.round((correctCount / questionCount) * 10) : 0;
+
+      let finalScore: number | string = computedScore;
+      if (Number.isFinite(parsedRawScoreNum) && parsedRawScoreNum > 0) {
+        finalScore = parsedRawScoreNum;
+      } else if (correctCount > 0) {
+        finalScore = computedScore;
+      } else if (Number.isFinite(parsedRawScoreNum)) {
+        finalScore = parsedRawScoreNum;
+      } else {
+        finalScore = rawScore;
       }
+
+      const numericScoreVal = typeof finalScore === 'number' ? finalScore : (finalScore !== '-' ? parseFloat(String(finalScore)) : 0);
+      const isPassed = !isNaN(numericScoreVal) ? numericScoreVal >= LOW_SCORE_THRESHOLD : false;
+
+      const rawGradeStatuses = submission.gradeStatuses || submission.questionStatuses || submission.gradeStatus;
+      const rawGradeNotes = submission.gradeNotes || submission.questionNotes;
+
+      const gradeStatuses: ('ok' | 'error' | 'uncertain')[] = Array.from({ length: questionCount }).map((_, qi) => {
+        if (Array.isArray(rawGradeStatuses) && rawGradeStatuses[qi]) {
+          return rawGradeStatuses[qi];
+        }
+        if (submission.aiFailedQuestions && Array.isArray(submission.aiFailedQuestions) && submission.aiFailedQuestions.includes(qi)) {
+          return 'error';
+        }
+        if (submission.uncertainQuestions && Array.isArray(submission.uncertainQuestions) && submission.uncertainQuestions.includes(qi)) {
+          return 'uncertain';
+        }
+        return 'ok';
+      });
+
+      const gradeNotes: string[] = Array.from({ length: questionCount }).map((_, qi) => {
+        if (Array.isArray(rawGradeNotes) && rawGradeNotes[qi]) {
+          return rawGradeNotes[qi];
+        }
+        const st = gradeStatuses[qi];
+        if (st === 'error') return `Câu ${qi + 1}: Lỗi kết nối mạng khi AI chấm bài`;
+        if (st === 'uncertain') return `Câu ${qi + 1}: Đáp án tự luận phức tạp, AI chưa khẳng định được`;
+        return '';
+      });
+
+      const errorDetails: { questionIndex: number; status: 'error' | 'uncertain'; note: string }[] = [];
+      gradeStatuses.forEach((st, qi) => {
+        if (st === 'error' || st === 'uncertain') {
+          errorDetails.push({
+            questionIndex: qi,
+            status: st,
+            note: gradeNotes[qi] || (st === 'error' ? 'Lỗi hệ thống khi chấm câu này' : 'Đáp án phức tạp, cần GV duyệt')
+          });
+        }
+      });
+
+      const hasOrangeAlert = errorDetails.length > 0;
+      const hasRedAlert = typeof numericScoreVal === 'number' && numericScoreVal < LOW_SCORE_THRESHOLD;
+
+      if (hasOrangeAlert) {
+        createNotificationIfNotExists({
+          teacherId: effectiveTeacherId,
+          studentId: stCode,
+          studentCode: stCode,
+          studentName: stName,
+          assignmentId: detailAssignment.id,
+          assignmentTitle: detailAssignment.title,
+          type: 'ai_failed',
+          message: `Bài làm của ${stName} (${stCode}) có ${errorDetails.length} câu AI chưa chấm được.`,
+          targetClass: detailAssignment.targetClass,
+          details: {
+            failedQuestionIndexes: errorDetails.map(e => e.questionIndex),
+            gradeNotes: errorDetails.map(e => e.note)
+          }
+        });
+      }
+
+      if (hasRedAlert) {
+        createNotificationIfNotExists({
+          teacherId: effectiveTeacherId,
+          studentId: stCode,
+          studentCode: stCode,
+          studentName: stName,
+          assignmentId: detailAssignment.id,
+          assignmentTitle: detailAssignment.title,
+          type: 'low_score',
+          message: `Học sinh ${stName} (${stCode}) làm bài đạt điểm dưới ${LOW_SCORE_THRESHOLD} (${numericScoreVal} điểm).`,
+          targetClass: detailAssignment.targetClass,
+          details: {
+            score: numericScoreVal
+          }
+        });
+      }
+
+      return {
+        code: stCode,
+        name: stName,
+        answers: evaluatedAnswers,
+        gradeStatuses,
+        gradeNotes,
+        totalScore: finalScore,
+        aiStatus: isPassed ? ('pass' as const) : ('fail' as const),
+        submittedTime: formatSubmissionDateTime(
+          submission.submittedAt ||
+            submission.submittedTime ||
+            submission.lastAttempt?.submittedAt ||
+            getCurrentSubmissionTimestamp()
+        ),
+        status: 'submitted' as const,
+        rawSubmission: submission,
+        hasOrangeAlert,
+        hasRedAlert,
+        errorQuestionsCount: errorDetails.length,
+        errorDetails
+      };
+    };
+
+    const processedCodes = new Set<string>();
+
+    // Bước 1: Duyệt theo danh sách lớp (nếu đã có danh sách lớp), đối chiếu DUY NHẤT qua studentCode
+    const resultList: StudentSubmissionRow[] = classStudentsRoster.map((st, idx) => {
+      const rawCode = st.code || st.id || `st-${idx + 1}`;
+      const normCode = extractCleanStudentCode({ studentCode: rawCode }, rawCode) || normalizeStudentCode(rawCode);
+      const stdFormatted = normalizeStudentCode(formatStandardStudentCode(rawCode, targetClassName));
+
+      if (normCode) processedCodes.add(normCode);
+      if (stdFormatted) processedCodes.add(stdFormatted);
+
+      // TUYỆT ĐỐI chỉ tìm theo Mã học sinh (normCode / stdFormatted), KHÔNG tìm theo tên học sinh
+      const submission =
+        (normCode && subMap.get(normCode)) ||
+        (stdFormatted && subMap.get(stdFormatted)) ||
+        null;
+
+      const displayCode = normCode || rawCode;
+      const displayName = st.name || st.fullName || `Học sinh (${displayCode})`;
 
       if (submission) {
-        const rawAnswers = submission.answers || submission.studentAnswers || submission.answersById;
-        const evaluatedAnswers: ('pass' | 'fail' | 'none')[] = Array.from({ length: questionCount }).map((_, qi) => {
-          const q = questions[qi];
-          let rawChoice: any = undefined;
-          if (Array.isArray(rawAnswers)) {
-            rawChoice = rawAnswers[qi];
-          } else if (rawAnswers && typeof rawAnswers === 'object') {
-            rawChoice = rawAnswers[qi] !== undefined 
-              ? rawAnswers[qi] 
-              : (rawAnswers[String(qi)] !== undefined ? rawAnswers[String(qi)] : (q?.id ? rawAnswers[q.id] : undefined));
-          }
-          if (rawChoice === undefined && submission.answersById && q?.id) {
-            rawChoice = submission.answersById[q.id];
-          }
-
-          // 1. Direct pass / fail values
-          if (rawChoice === 'pass' || rawChoice === true || rawChoice === 'correct') return 'pass';
-          if (rawChoice === 'fail' || rawChoice === false || rawChoice === 'incorrect') return 'fail';
-
-          // 2. Pre-evaluated questionResults if present
-          const preEvaluated = submission.questionResults || submission.results || submission.gradedAnswers;
-          if (Array.isArray(preEvaluated) && preEvaluated[qi] !== undefined) {
-            const p = preEvaluated[qi];
-            if (typeof p === 'boolean') return p ? 'pass' : 'fail';
-            if (p === 'pass' || p === 'fail') return p;
-            if (p && typeof p === 'object' && p.isCorrect !== undefined) return p.isCorrect ? 'pass' : 'fail';
-          }
-
-          // 3. Question-level evaluation via checkQuestionCorrectLocal
-          if (q && rawChoice !== undefined && rawChoice !== null && rawChoice !== '') {
-            try {
-              return checkQuestionCorrectLocal(q, rawChoice) ? 'pass' : 'fail';
-            } catch (err) {
-              console.warn(`Lỗi chấm điểm câu ${qi}:`, err);
-            }
-          }
-          return 'fail';
-        });
-
-        const correctCount = evaluatedAnswers.filter(a => a === 'pass').length;
-        const computedScore = questionCount > 0 ? Math.round((correctCount / questionCount) * 10) : 0;
-
-        const rawScore = submission.score !== undefined ? submission.score : (submission.totalScore !== undefined ? submission.totalScore : '-');
-        let finalScore: number | string = computedScore;
-        if (rawScore !== undefined && rawScore !== null && rawScore !== '-' && rawScore !== '0' && rawScore !== 0) {
-          const num = typeof rawScore === 'number' ? rawScore : parseFloat(String(rawScore));
-          if (!isNaN(num) && num > 0) finalScore = num;
-          else if (correctCount > 0) finalScore = computedScore;
-        } else if (correctCount > 0) {
-          finalScore = computedScore;
-        } else {
-          finalScore = rawScore;
-        }
-
-        const numericScoreVal = typeof finalScore === 'number' ? finalScore : (finalScore !== '-' ? parseFloat(String(finalScore)) : 0);
-        const isPassed = !isNaN(numericScoreVal) ? numericScoreVal >= LOW_SCORE_THRESHOLD : false;
-
-        // Trạng thái chấm từng câu (gradeStatus: 'ok' | 'error' | 'uncertain') và lý do (gradeNote)
-        const rawGradeStatuses = submission.gradeStatuses || submission.questionStatuses || submission.gradeStatus;
-        const rawGradeNotes = submission.gradeNotes || submission.questionNotes;
-
-        const gradeStatuses: ('ok' | 'error' | 'uncertain')[] = Array.from({ length: questionCount }).map((_, qi) => {
-          if (Array.isArray(rawGradeStatuses) && rawGradeStatuses[qi]) {
-            return rawGradeStatuses[qi];
-          }
-          if (submission.aiFailedQuestions && Array.isArray(submission.aiFailedQuestions) && submission.aiFailedQuestions.includes(qi)) {
-            return 'error';
-          }
-          if (submission.uncertainQuestions && Array.isArray(submission.uncertainQuestions) && submission.uncertainQuestions.includes(qi)) {
-            return 'uncertain';
-          }
-          return 'ok';
-        });
-
-        const gradeNotes: string[] = Array.from({ length: questionCount }).map((_, qi) => {
-          if (Array.isArray(rawGradeNotes) && rawGradeNotes[qi]) {
-            return rawGradeNotes[qi];
-          }
-          const st = gradeStatuses[qi];
-          if (st === 'error') return `Câu ${qi + 1}: Lỗi kết nối mạng khi AI chấm bài`;
-          if (st === 'uncertain') return `Câu ${qi + 1}: Đáp án tự luận phức tạp, AI chưa khẳng định được`;
-          return '';
-        });
-
-        const errorDetails: { questionIndex: number; status: 'error' | 'uncertain'; note: string }[] = [];
-        gradeStatuses.forEach((st, qi) => {
-          if (st === 'error' || st === 'uncertain') {
-            errorDetails.push({
-              questionIndex: qi,
-              status: st,
-              note: gradeNotes[qi] || (st === 'error' ? 'Lỗi hệ thống khi chấm câu này' : 'Đáp án phức tạp, cần GV duyệt')
-            });
-          }
-        });
-
-        const hasOrangeAlert = errorDetails.length > 0;
-        const hasRedAlert = typeof numericScoreVal === 'number' && numericScoreVal < LOW_SCORE_THRESHOLD;
-        const stCode = st.code || `st-${idx + 1}`;
-        const stName = st.name || st.fullName || `Học sinh ${idx + 1}`;
-
-        // Auto trigger notifications for orange and red alerts
-        if (hasOrangeAlert) {
-          createNotificationIfNotExists({
-            teacherId: effectiveTeacherId,
-            studentId: stCode,
-            studentCode: stCode,
-            studentName: stName,
-            assignmentId: detailAssignment.id,
-            assignmentTitle: detailAssignment.title,
-            type: 'ai_failed',
-            message: `Bài làm của ${stName} có ${errorDetails.length} câu AI chưa chấm được.`,
-            targetClass: detailAssignment.targetClass,
-            details: {
-              failedQuestionIndexes: errorDetails.map(e => e.questionIndex),
-              gradeNotes: errorDetails.map(e => e.note)
-            }
-          });
-        }
-
-        if (hasRedAlert) {
-          createNotificationIfNotExists({
-            teacherId: effectiveTeacherId,
-            studentId: stCode,
-            studentCode: stCode,
-            studentName: stName,
-            assignmentId: detailAssignment.id,
-            assignmentTitle: detailAssignment.title,
-            type: 'low_score',
-            message: `Học sinh ${stName} làm bài đạt điểm dưới ${LOW_SCORE_THRESHOLD} (${numericScoreVal} điểm).`,
-            targetClass: detailAssignment.targetClass,
-            details: {
-              score: numericScoreVal
-            }
-          });
-        }
-
-        return {
-          code: stCode,
-          name: stName,
-          answers: evaluatedAnswers,
-          gradeStatuses,
-          gradeNotes,
-          totalScore: finalScore,
-          aiStatus: isPassed ? ('pass' as const) : ('fail' as const),
-          submittedTime: formatSubmissionDateTime(submission.submittedAt || submission.submittedTime || getCurrentSubmissionTimestamp()),
-          status: 'submitted' as const,
-          rawSubmission: submission,
-          hasOrangeAlert,
-          hasRedAlert,
-          errorQuestionsCount: errorDetails.length,
-          errorDetails
-        };
-      } else {
-        return {
-          code: st.code || `st-${idx + 1}`,
-          name: st.name || st.fullName || `Học sinh ${idx + 1}`,
-          answers: Array.from({ length: questionCount }).map(() => 'none' as const),
-          totalScore: '-',
-          aiStatus: 'none' as const,
-          submittedTime: 'Chờ HS',
-          status: 'waiting' as const
-        };
+        return buildSubmittedStudentRow(displayCode, displayName, submission);
       }
+
+      return {
+        code: displayCode,
+        name: displayName,
+        answers: Array.from({ length: questionCount }).map(() => 'none' as const),
+        totalScore: '-',
+        aiStatus: 'none' as const,
+        submittedTime: 'Chờ HS',
+        status: 'waiting' as const
+      };
+    });
+
+    // Bước 2: Bổ sung TẤT CẢ các bài nộp trong subMap mà Mã học sinh chưa nằm trong classStudentsRoster
+    // (Đảm bảo dù danh sách lớp trống 0 học sinh, chưa đồng bộ, hoặc khác tên lớp/họ tên thì bảng VẪN HIỂN THỊ ĐẦY ĐỦ kết quả!)
+    subMap.forEach((submission, normCode) => {
+      if (!normCode || processedCodes.has(normCode)) return;
+      processedCodes.add(normCode);
+
+      const stdFormatted = normalizeStudentCode(formatStandardStudentCode(normCode, targetClassName));
+      if (stdFormatted) processedCodes.add(stdFormatted);
+
+      const rosterSt = rosterByCode.get(normCode) || (stdFormatted ? rosterByCode.get(stdFormatted) : null);
+      const displayName =
+        rosterSt?.name ||
+        rosterSt?.fullName ||
+        submission.studentName ||
+        submission.name ||
+        submission.fullName ||
+        `Học sinh (${normCode})`;
+
+      resultList.push(buildSubmittedStudentRow(normCode, displayName, submission));
     });
 
     if (detailAssignment?.id) {
@@ -3724,7 +3750,7 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
                 <p className="text-xs text-slate-600 mt-1 font-medium">
                   Bài tập: <span className="font-extrabold text-slate-800">{detailAssignment.title || 'Bài tập: Luyện tập Khối 4'}</span>
                   <span className="mx-2 text-slate-300">•</span>
-                  Sĩ số {detailAssignment.targetClass ? (detailAssignment.targetClass.startsWith('Lớp') ? detailAssignment.targetClass : `Lớp ${detailAssignment.targetClass}`) : 'Lớp 4A'}: <span className="font-extrabold text-indigo-900">{trackingStudentsList.length || (detailAssignment.targetClass ? getClassStudentCount(detailAssignment.targetClass, detailAssignment.totalStudents) : (detailAssignment.totalStudents || 38))} học sinh</span>
+                  Sĩ số {detailAssignment.targetClass ? (detailAssignment.targetClass.startsWith('Lớp') ? detailAssignment.targetClass : `Lớp ${detailAssignment.targetClass}`) : 'Lớp 4C'}: <span className="font-extrabold text-indigo-900">{trackingStudentsList.length} học sinh</span>
                 </p>
               </div>
 
@@ -4219,7 +4245,8 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
           targetItem={detailAssignment}
           studentSubmission={selectedStudentDetail}
           onSaveRegrade={async () => {
-            showToast(`Đã lưu kết quả chấm lại cho học sinh ${selectedStudentDetail.name} thành công!`);
+            showToast(`Đã lưu kết quả chấm lại cho học sinh ${selectedStudentDetail.name} (${selectedStudentDetail.code}) thành công!`);
+            await handleSyncSubmissions(false);
           }}
           onDeleteSubmission={() => {
             showToast(`Đã xoá bài làm của học sinh ${selectedStudentDetail.name}`);

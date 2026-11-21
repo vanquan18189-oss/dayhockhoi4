@@ -542,11 +542,16 @@ export const StudentAssignmentModule: React.FC<StudentAssignmentModuleProps> = (
       id: newSub.id || `${authenticCode}_${assignmentId}`,
       recordType: 'assignment' as const,
       assignmentId,
+      targetId: assignmentId,
+      originalAssignmentId: newSub.assignment?.originalAssignmentId || null,
+      title: newSub.title || newSub.assignment?.title || 'Bài tập',
+      subject: newSub.subject || newSub.assignment?.subject || 'Môn học',
       studentId: authenticCode,
       studentCode: authenticCode,
       maHs: authenticCode,
       code: authenticCode,
       studentName: effectiveUserName || 'Học sinh',
+      studentClass: studentClass || newSub.assignment?.targetClass || '',
       score: numScore,
       totalScore: numScore,
       correctCount,
@@ -609,6 +614,7 @@ export const StudentAssignmentModule: React.FC<StudentAssignmentModuleProps> = (
             transaction.set(subDocRef, sanitizeForFirestore({
               ...submissionRecord,
               assignmentId,
+              targetId: assignmentId,
               updatedAt: new Date().toISOString()
             }), { merge: true });
 
@@ -630,6 +636,7 @@ export const StudentAssignmentModule: React.FC<StudentAssignmentModuleProps> = (
             setDoc(subDocRef, sanitizeForFirestore({
               ...submissionRecord,
               assignmentId,
+              targetId: assignmentId,
               updatedAt: new Date().toISOString()
             }), { merge: true }),
             8000,
@@ -641,18 +648,36 @@ export const StudentAssignmentModule: React.FC<StudentAssignmentModuleProps> = (
       }
 
       try {
-        await withFirestoreTimeout(
-          studentResultService.saveAssignmentResult(authenticCode, {
-            assignmentId,
-            score: numScore,
-            maxScore: 10,
-            submittedAt: safeSubmittedTime,
-            answers: normalizedAnswers,
-            keepAttempts: 'last'
-          }),
-          8000,
-          'StudentAssignmentModule.saveAssignmentResult'
-        );
+        await Promise.allSettled([
+          withFirestoreTimeout(
+            studentResultService.saveFullAssignmentSubmission(authenticCode, assignmentId, submissionRecord),
+            8000,
+            'StudentAssignmentModule.saveFullAssignmentSubmission'
+          ),
+          withFirestoreTimeout(
+            studentResultService.saveAssignmentResult(authenticCode, {
+              assignmentId,
+              targetId: assignmentId,
+              originalAssignmentId: newSub.assignment?.originalAssignmentId || null,
+              title: newSub.title || newSub.assignment?.title || 'Bài tập',
+              subject: newSub.subject || newSub.assignment?.subject || 'Môn học',
+              studentName: effectiveUserName || 'Học sinh',
+              studentClass: studentClass || newSub.assignment?.targetClass || '',
+              score: numScore,
+              totalScore: numScore,
+              maxScore: 10,
+              correctCount,
+              totalQuestions,
+              submittedAt: safeSubmittedTime,
+              submittedTime: safeSubmittedTime,
+              answers: normalizedAnswers,
+              answersById,
+              keepAttempts: 'last'
+            }),
+            8000,
+            'StudentAssignmentModule.saveAssignmentResult'
+          )
+        ]);
       } catch (resErr) {
         console.warn('⚠️ Lỗi cập nhật student_results (đã lưu dự phòng LocalStorage):', resErr);
       }
@@ -808,6 +833,8 @@ export const StudentAssignmentModule: React.FC<StudentAssignmentModuleProps> = (
 
     const examFromAssignment: ExamPaper = {
       id: solvingAssignment.id,
+      originalExamId: solvingAssignment.originalAssignmentId,
+      targetClass: solvingAssignment.targetClass,
       title: solvingAssignment.title,
       subject: solvingAssignment.subject || 'Toán',
       grade: solvingAssignment.grade || 'Khối 4',

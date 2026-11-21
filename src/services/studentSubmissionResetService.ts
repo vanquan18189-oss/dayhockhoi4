@@ -8,11 +8,17 @@ import {
   getDocs, 
   deleteField 
 } from 'firebase/firestore';
-import { normalizeStudentCode, normalizeStudentName } from './studentCode';
+import { normalizeStudentCode } from './studentCode';
 import { deleteExamDraft } from './examDraftService';
 import { invalidateAllSubmissionsCache } from './hocBaDataService';
-import { normalizeClassKey } from './studentSessionService';
 import { backupSubmissionBeforeDelete } from './unmatchedSubmissionsService';
+import {
+  studentResultService,
+  extractCleanStudentCode,
+  getCandidateAssignmentIds,
+  isMatchingStudentCode
+} from './studentResultService';
+import { clearMemoryTrackingData, clearIndexedDBTrackingData } from './assignmentTrackingData';
 
 export interface ResetSubmissionOptions {
   studentCode: string;
@@ -24,20 +30,21 @@ export interface ResetSubmissionOptions {
 }
 
 /**
- * Xóa triệt để và đồng bộ toàn bộ dữ liệu bài làm của học sinh trên Firestore & LocalStorage:
- * - Subcollection `exams/{examId}/submissions` (tất cả các bản ghi khớp mã/tên)
- * - Mảng `submissions` trong master document `exams/{examId}`
- * - Các biến thể doc ID: standardDocId, legacyDocId, originalExamId
- * - Hồ sơ kết quả `student_results/{studentCode}` (xóa subcollection doc và xóa key exams.{examId})
- * - Bản nháp `exam_drafts/{studentCode}_{examId}`
- * - Tiến độ làm bài `exam_progress` (nếu có)
- * - Toàn bộ cache LocalStorage và broadcast sự kiện đồng bộ
+ * Xóa triệt để và đồng bộ toàn bộ dữ liệu bài làm của học sinh trên Firestore & LocalStorage
+ * DUY NHẤT theo Mã học sinh (studentCode viết hoa, trim khoảng trắng), KHÔNG phụ thuộc tên học sinh.
  */
 export async function resetOrDeleteStudentExamSubmission(
   options: ResetSubmissionOptions
 ): Promise<{ success: boolean; deletedCount: number }> {
-  const { studentCode, studentName, studentId, examId, originalExamId, targetClass } = options;
-  const normCode = normalizeStudentCode(studentCode || studentId || '');
+  const { studentCode, studentId, examId, originalExamId, targetClass } = options;
+  const rawInputCode = String(studentCode || studentId || '').trim();
+  const normCode = (
+    extractCleanStudentCode({ studentCode: rawInputCode }, rawInputCode) ||
+    normalizeStudentCode(rawInputCode)
+  )
+    .trim()
+    .toUpperCase();
+
   if (!normCode) {
     throw new Error('Mã học sinh không hợp lệ.');
   }
@@ -45,16 +52,11 @@ export async function resetOrDeleteStudentExamSubmission(
     throw new Error('Mã đề kiểm tra không hợp lệ.');
   }
 
-  const normName = studentName ? normalizeStudentName(studentName) : '';
-  const classKey = normalizeClassKey(targetClass || '').toLowerCase();
-  const examBaseId = (originalExamId || examId || '').replace(/^ex-/, '').replace(/^as-/, '').replace(/-class-.*$/, '');
-
-  const candDocIds = Array.from(new Set([
-    examId,
-    `ex-${examBaseId}-class-${classKey}`,
-    `ex-${examBaseId}-class-lp${classKey}`,
-    originalExamId
-  ].filter(Boolean) as string[]));
+  const candDocIds = getCandidateAssignmentIds({
+    id: examId,
+    originalAssignmentId: originalExamId,
+    targetClass
+  });
 
   let deletedCount = 0;
 
@@ -69,23 +71,7 @@ export async function resetOrDeleteStudentExamSubmission(
         const deletePromises: Promise<any>[] = [];
         subSnap.forEach((docSnap) => {
           const data = docSnap.data();
-          const docCode = normalizeStudentCode(data.studentCode || data.code || data.maHs || data.studentId || '');
-          const docIdStr = docSnap.id.toLowerCase();
-          const targetLower = normCode.toLowerCase();
-
-          const isIdMatch = docIdStr === targetLower ||
-                            docIdStr.startsWith(`${targetLower}_`) ||
-                            docIdStr.startsWith(`sub-${docId.toLowerCase()}-${targetLower}`) ||
-                            docIdStr.includes(targetLower);
-
-          const isCodeMatch = Boolean(docCode && docCode === normCode);
-
-          const isNameMatch = Boolean(
-            normName && 
-            normalizeStudentName(data.studentName || data.name || '') === normName
-          );
-
-          if (isIdMatch || isCodeMatch || isNameMatch) {
+          if (isMatchingStudentCode(normCode, data, docSnap.id)) {
             deletePromises.push(
               deleteDoc(doc(db, 'exams', docId, 'submissions', docSnap.id))
                 .then(() => { deletedCount++; })
@@ -96,12 +82,13 @@ export async function resetOrDeleteStudentExamSubmission(
           }
         });
 
-        // Đảm bảo xóa cả các ID mẫu cố định nếu chưa quét trúng
+        // Đảm bảo xóa cả các ID cố định
         deletePromises.push(deleteDoc(doc(db, 'exams', docId, 'submissions', normCode)).catch(() => {}));
+        deletePromises.push(deleteDoc(doc(db, 'exams', docId, 'submissions', `${normCode}_${docId}`)).catch(() => {}));
         deletePromises.push(deleteDoc(doc(db, 'exams', docId, 'submissions', `${normCode}_${docId}_1`)).catch(() => {}));
         deletePromises.push(deleteDoc(doc(db, 'exams', docId, 'submissions', `sub-${docId}-${normCode}`)).catch(() => {}));
 
-        await Promise.all(deletePromises);
+        await Promise.allSettled(deletePromises);
 
         // B. Cập nhật mảng submissions trên master document exams/{docId}
         const masterRef = doc(db, 'exams', docId);
@@ -111,14 +98,7 @@ export async function resetOrDeleteStudentExamSubmission(
           if (Array.isArray(masterData.submissions)) {
             const filteredSubs = masterData.submissions.filter((s: any) => {
               if (!s) return false;
-              const sCode = normalizeStudentCode(s.studentCode || s.code || s.maHs || s.studentId || '');
-              const sId = String(s.id || '').toLowerCase();
-              const sName = normalizeStudentName(s.studentName || s.name || '');
-
-              if (sCode === normCode) return false;
-              if (sId.includes(normCode.toLowerCase())) return false;
-              if (normName && sName === normName) return false;
-              return true;
+              return !isMatchingStudentCode(normCode, s, s.id);
             });
 
             await updateDoc(masterRef, {
@@ -135,12 +115,11 @@ export async function resetOrDeleteStudentExamSubmission(
           const asDeletePromises: Promise<any>[] = [];
           asSnap.forEach((docSnap) => {
             const data = docSnap.data();
-            const docCode = normalizeStudentCode(data.studentCode || data.code || data.maHs || data.studentId || '');
-            if (docCode === normCode || docSnap.id.includes(normCode.toLowerCase())) {
+            if (isMatchingStudentCode(normCode, data, docSnap.id)) {
               asDeletePromises.push(deleteDoc(doc(db, 'assignments', docId, 'submissions', docSnap.id)).catch(() => {}));
             }
           });
-          await Promise.all(asDeletePromises);
+          await Promise.allSettled(asDeletePromises);
 
           const asMasterRef = doc(db, 'assignments', docId);
           const asMasterSnap = await getDoc(asMasterRef);
@@ -148,8 +127,8 @@ export async function resetOrDeleteStudentExamSubmission(
             const asData = asMasterSnap.data();
             if (Array.isArray(asData.submissions)) {
               const filteredAsSubs = asData.submissions.filter((s: any) => {
-                const sCode = normalizeStudentCode(s.studentCode || s.code || s.maHs || s.studentId || '');
-                return sCode !== normCode && !String(s.id || '').includes(normCode.toLowerCase());
+                if (!s) return false;
+                return !isMatchingStudentCode(normCode, s, s.id);
               });
               await updateDoc(asMasterRef, {
                 submissions: filteredAsSubs,
@@ -159,44 +138,28 @@ export async function resetOrDeleteStudentExamSubmission(
           }
         } catch {}
       } catch (err: any) {
-        console.error(`Lỗi khi dọn dẹp Firestore cho exam ${docId}:`, err);
-        throw new Error(`Lỗi cơ sở dữ liệu: ${err?.message || 'Không thể xóa bài làm'}`);
+        console.warn(`Lỗi khi dọn dẹp Firestore cho exam ${docId}:`, err);
       }
     }
 
-    // D. Xóa trong hồ sơ kết quả học tập cá nhân `student_results/{normCode}`
+    // D. Xóa trong collection `student_results` theo studentCode & targetId/assignmentId/examId
     try {
-      const srDocRef = doc(db, 'student_results', normCode);
-      const srSnap = await getDoc(srDocRef);
-      if (srSnap.exists()) {
-        const updateFields: Record<string, any> = {
-          updatedAt: new Date().toISOString()
-        };
-        for (const docId of candDocIds) {
-          updateFields[`exams.${docId}`] = deleteField();
-          updateFields[`assignments.${docId}`] = deleteField();
-        }
-        await updateDoc(srDocRef, updateFields);
-      }
-
-      for (const docId of candDocIds) {
-        await deleteDoc(doc(db, 'student_results', normCode, 'exams', docId)).catch(() => {});
-        await deleteDoc(doc(db, 'student_results', normCode, 'assignments', docId)).catch(() => {});
-      }
+      const srDeleted = await studentResultService.deleteAssignmentSubmissionByStudentCode(normCode, {
+        id: examId,
+        originalAssignmentId: originalExamId,
+        targetClass
+      });
+      deletedCount += srDeleted;
     } catch (srErr) {
       console.warn('Lỗi cập nhật student_results khi xóa bài:', srErr);
     }
 
-    // E. Xóa bản nháp `exam_drafts`
+    // E. Xóa bản nháp `exam_drafts` và `exam_progress`
     for (const docId of candDocIds) {
       await deleteExamDraft(normCode, docId).catch(() => {});
       try {
         await deleteDoc(doc(db, 'exam_drafts', `${normCode}_${docId}`));
       } catch {}
-    }
-
-    // F. Xóa tiến độ `exam_progress` (nếu có)
-    for (const docId of candDocIds) {
       try {
         await deleteDoc(doc(db, 'exam_progress', `${normCode}_${docId}`));
       } catch {}
@@ -204,69 +167,13 @@ export async function resetOrDeleteStudentExamSubmission(
   }
 
   // 2. Dọn dẹp triệt để trong LocalStorage
-  if (typeof window !== 'undefined') {
-    try {
-      // Xóa các key bài làm riêng biệt của học sinh
-      const studentKeys = [normCode, studentId, studentCode].filter(Boolean) as string[];
-      studentKeys.forEach(k => {
-        localStorage.removeItem(`eduplay_k4_student_exam_subs_${k}`);
-        localStorage.removeItem(`eduplay_k4_student_exam_submissions_${k}`);
-        localStorage.removeItem(`eduplay_k4_student_submissions_${k}`);
-      });
-
-      candDocIds.forEach(docId => {
-        localStorage.removeItem(`eduplay_k4_exam_subs_${docId}`);
-        studentKeys.forEach(k => {
-          localStorage.removeItem(`eduplay_k4_exam_draft_${k}_${docId}`);
-        });
-      });
-
-      // Lọc bỏ khỏi eduplay_all_exam_submissions
-      const allSubsRaw = localStorage.getItem('eduplay_k4_all_exam_submissions');
-      if (allSubsRaw) {
-        const allSubs = JSON.parse(allSubsRaw);
-        if (Array.isArray(allSubs)) {
-          const filtered = allSubs.filter((s: any) => {
-            const sCode = normalizeStudentCode(s.studentCode || s.code || s.maHs || s.studentId || '');
-            const sExamId = String(s.examId || s.id || s.exam?.id || '').trim();
-            const isMatchExam = candDocIds.some(cid => sExamId.includes(cid));
-            if (sCode === normCode && isMatchExam) return false;
-            return true;
-          });
-          localStorage.setItem('eduplay_k4_all_exam_submissions', JSON.stringify(filtered));
-        }
-      }
-
-      // Quét toàn bộ key tiền tố eduplay_student_exam_subs_
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (k && (k.startsWith('eduplay_k4_student_exam_subs_') || k.startsWith('eduplay_k4_student_exam_submissions_'))) {
-          const raw = localStorage.getItem(k);
-          if (raw) {
-            try {
-              const parsed = JSON.parse(raw);
-              if (Array.isArray(parsed)) {
-                const cleaned = parsed.filter((item: any) => {
-                  const itemExamId = String(item.examId || item.id || item.exam?.id || '');
-                  const itemCode = normalizeStudentCode(item.studentCode || item.code || item.maHs || item.studentId || '');
-                  const isMatchExam = candDocIds.some(cid => itemExamId.includes(cid));
-                  if (itemCode === normCode && isMatchExam) return false;
-                  return true;
-                });
-                localStorage.setItem(k, JSON.stringify(cleaned));
-              }
-            } catch {}
-          }
-        }
-      }
-    } catch (lsErr) {
-      console.warn('Lỗi dọn LocalStorage khi xóa bài:', lsErr);
-    }
-  }
+  cleanLocalStorageSubmissionsForStudent(normCode, [rawInputCode, studentId, studentCode], candDocIds);
 
   // 3. Làm mới Cache và Broadcast sự kiện toàn hệ thống
   try {
     invalidateAllSubmissionsCache();
+    clearMemoryTrackingData();
+    await clearIndexedDBTrackingData();
   } catch {}
 
   if (typeof window !== 'undefined') {
@@ -286,6 +193,129 @@ export async function resetOrDeleteStudentExamSubmission(
 }
 
 /**
+ * Helper dọn sạch mọi bản ghi bài nộp của một học sinh cho một bài tập/đề thi trong LocalStorage
+ */
+function cleanLocalStorageSubmissionsForStudent(
+  normCode: string,
+  extraStudentKeys: (string | undefined)[],
+  candDocIds: string[]
+): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const candIdSet = new Set(candDocIds);
+    const matchesTargetAssignment = (rawId: any): boolean => {
+      const idStr = String(rawId || '').trim();
+      if (!idStr) return false;
+      const rootStr = idStr.replace(/-class-.*$/i, '').trim();
+      return (
+        candIdSet.has(idStr) ||
+        (Boolean(rootStr) && candIdSet.has(rootStr)) ||
+        candDocIds.some((cid) => idStr.includes(cid) || cid.includes(idStr))
+      );
+    };
+
+    const studentKeys = Array.from(
+      new Set([normCode, normCode.toLowerCase(), ...extraStudentKeys].filter(Boolean) as string[])
+    );
+
+    // 1. Lọc hoặc xóa các key theo mã bài tập: eduplay_k4_exam_subs_${docId}
+    candDocIds.forEach((docId) => {
+      const key = `eduplay_k4_exam_subs_${docId}`;
+      const raw = localStorage.getItem(key);
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            const filtered = parsed.filter((s: any) => !isMatchingStudentCode(normCode, s, s?.id));
+            if (filtered.length > 0) {
+              localStorage.setItem(key, JSON.stringify(filtered));
+            } else {
+              localStorage.removeItem(key);
+            }
+          } else {
+            localStorage.removeItem(key);
+          }
+        } catch {
+          localStorage.removeItem(key);
+        }
+      }
+
+      studentKeys.forEach((k) => {
+        localStorage.removeItem(`eduplay_k4_exam_draft_${k}_${docId}`);
+      });
+    });
+
+    // 2. Lọc bỏ khỏi eduplay_k4_all_exam_submissions và eduplay_k4_all_assignment_submissions
+    for (const globalKey of ['eduplay_k4_all_exam_submissions', 'eduplay_k4_all_assignment_submissions']) {
+      const allSubsRaw = localStorage.getItem(globalKey);
+      if (allSubsRaw) {
+        try {
+          const allSubs = JSON.parse(allSubsRaw);
+          if (Array.isArray(allSubs)) {
+            const filtered = allSubs.filter((s: any) => {
+              if (!s) return false;
+              const isCodeMatch = isMatchingStudentCode(normCode, s, s.id);
+              if (!isCodeMatch) return true;
+              const itemTargetId =
+                s.assignmentId || s.targetId || s.examId || s.assignment?.id || s.exam?.id || s.id || '';
+              return !matchesTargetAssignment(itemTargetId);
+            });
+            localStorage.setItem(globalKey, JSON.stringify(filtered));
+          }
+        } catch {}
+      }
+    }
+
+    // 3. Quét toàn bộ các key lưu bài làm của học sinh trong localStorage
+    const keysToInspect: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k) keysToInspect.push(k);
+    }
+
+    for (const k of keysToInspect) {
+      if (
+        k.startsWith('eduplay_k4_student_submissions_') ||
+        k.startsWith('eduplay_k4_student_exam_subs_') ||
+        k.startsWith('eduplay_k4_student_exam_submissions_')
+      ) {
+        const keySuffix = k
+          .replace(/^eduplay_k4_student_submissions_/, '')
+          .replace(/^eduplay_k4_student_exam_subs_/, '')
+          .replace(/^eduplay_k4_student_exam_submissions_/, '')
+          .trim();
+        const isKeyForStudent = isMatchingStudentCode(normCode, { studentCode: keySuffix }, keySuffix);
+
+        const raw = localStorage.getItem(k);
+        if (!raw) continue;
+        try {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            const cleaned = parsed.filter((item: any) => {
+              if (!item) return false;
+              const isCodeMatch = isKeyForStudent || isMatchingStudentCode(normCode, item, item.id);
+              if (!isCodeMatch) return true;
+              const itemAssignId =
+                item.assignmentId ||
+                item.targetId ||
+                item.examId ||
+                item.assignment?.id ||
+                item.exam?.id ||
+                item.id ||
+                '';
+              return !matchesTargetAssignment(itemAssignId);
+            });
+            localStorage.setItem(k, JSON.stringify(cleaned));
+          }
+        } catch {}
+      }
+    }
+  } catch (lsErr) {
+    console.warn('Lỗi dọn LocalStorage khi xóa bài nộp:', lsErr);
+  }
+}
+
+/**
  * Xóa một bài nộp chưa khớp (orphaned/unmatched submission) cụ thể trên Firestore
  */
 export async function deleteSingleUnmatchedSubmission(
@@ -296,7 +326,6 @@ export async function deleteSingleUnmatchedSubmission(
   if (!db || !examId || !submissionDocId) return false;
 
   try {
-    // 0. Sao lưu tài liệu sang 'deleted_submissions_backup' trước khi xóa
     try {
       const snap = await getDoc(doc(db, 'exams', examId, 'submissions', submissionDocId));
       if (snap.exists()) {
@@ -306,10 +335,8 @@ export async function deleteSingleUnmatchedSubmission(
       console.warn('Lỗi sao lưu trước khi xóa đơn:', bErr);
     }
 
-    // 1. Xóa trong subcollection exams/{examId}/submissions/{submissionDocId}
     await deleteDoc(doc(db, 'exams', examId, 'submissions', submissionDocId));
 
-    // 2. Xóa trong master document exams/{examId}
     const masterRef = doc(db, 'exams', examId);
     const snap = await getDoc(masterRef);
     if (snap.exists()) {
@@ -317,7 +344,7 @@ export async function deleteSingleUnmatchedSubmission(
       if (Array.isArray(data.submissions)) {
         const filtered = data.submissions.filter((s: any) => {
           if (s.id === submissionDocId) return false;
-          if (rawStudentCode && normalizeStudentCode(s.studentCode || s.studentId || '') === normalizeStudentCode(rawStudentCode)) return false;
+          if (rawStudentCode && isMatchingStudentCode(rawStudentCode, s, s.id)) return false;
           return true;
         });
         await updateDoc(masterRef, {
@@ -361,11 +388,10 @@ export async function cleanAllUnmatchedExamSubmissions(
       const deletePromises: Promise<any>[] = [];
       subSnap.forEach((docSnap) => {
         const data = docSnap.data();
-        const code = normalizeStudentCode(data.studentCode || data.code || data.maHs || data.studentId || docSnap.id || '');
+        const code = extractCleanStudentCode(data, docSnap.id);
         if (!validSet.has(code)) {
           deletePromises.push(
             (async () => {
-              // Sao lưu an toàn sang 'deleted_submissions_backup' trước khi xóa
               await backupSubmissionBeforeDelete(exId, docSnap.id, data, 'clean_all_unmatched');
               await deleteDoc(doc(db, 'exams', exId, 'submissions', docSnap.id));
               totalDeleted++;
@@ -376,14 +402,13 @@ export async function cleanAllUnmatchedExamSubmissions(
 
       await Promise.all(deletePromises);
 
-      // Cập nhật master document
       const masterRef = doc(db, 'exams', exId);
       const masterSnap = await getDoc(masterRef);
       if (masterSnap.exists()) {
         const data = masterSnap.data();
         if (Array.isArray(data.submissions)) {
           const filtered = data.submissions.filter((s: any) => {
-            const code = normalizeStudentCode(s.studentCode || s.code || s.maHs || s.studentId || s.id || '');
+            const code = extractCleanStudentCode(s, s?.id);
             return validSet.has(code);
           });
           await updateDoc(masterRef, {
@@ -397,7 +422,6 @@ export async function cleanAllUnmatchedExamSubmissions(
     }
   }
 
-  // Also clean LocalStorage
   if (typeof window !== 'undefined') {
     try {
       const allRaw = localStorage.getItem('eduplay_k4_all_exam_submissions');
@@ -405,7 +429,7 @@ export async function cleanAllUnmatchedExamSubmissions(
         const parsed = JSON.parse(allRaw);
         if (Array.isArray(parsed)) {
           const cleaned = parsed.filter((item: any) => {
-            const code = normalizeStudentCode(item.studentCode || item.code || item.maHs || item.studentId || '');
+            const code = extractCleanStudentCode(item, item?.id);
             const isMatchExam = allExamIds.some(id => String(item.examId || '').includes(id));
             if (isMatchExam && !validSet.has(code)) return false;
             return true;
@@ -434,16 +458,25 @@ export interface ResetAssignmentSubmissionOptions {
   assignmentId: string;
   originalAssignmentId?: string;
   targetClass?: string;
+  title?: string;
 }
 
 /**
  * Xóa triệt để và đồng bộ toàn bộ dữ liệu bài làm của học sinh cho bài tập rèn luyện trên Firestore & LocalStorage
+ * DUY NHẤT theo Mã học sinh (studentCode viết hoa, trim khoảng trắng), TUYỆT ĐỐI KHÔNG phụ thuộc tên học sinh.
  */
 export async function resetOrDeleteStudentAssignmentSubmission(
   options: ResetAssignmentSubmissionOptions
 ): Promise<{ success: boolean; deletedCount: number }> {
-  const { studentCode, studentName, studentId, assignmentId, originalAssignmentId, targetClass } = options;
-  const normCode = normalizeStudentCode(studentCode || studentId || '');
+  const { studentCode, studentId, assignmentId, originalAssignmentId, targetClass, title } = options;
+  const rawInputCode = String(studentCode || studentId || '').trim();
+  const normCode = (
+    extractCleanStudentCode({ studentCode: rawInputCode }, rawInputCode) ||
+    normalizeStudentCode(rawInputCode)
+  )
+    .trim()
+    .toUpperCase();
+
   if (!normCode) {
     throw new Error('Mã học sinh không hợp lệ.');
   }
@@ -451,21 +484,18 @@ export async function resetOrDeleteStudentAssignmentSubmission(
     throw new Error('Mã bài tập không hợp lệ.');
   }
 
-  const normName = studentName ? normalizeStudentName(studentName) : '';
-  const classKey = normalizeClassKey(targetClass || '').toLowerCase();
-  const assignBaseId = (originalAssignmentId || assignmentId || '').replace(/^as-/, '').replace(/^ex-/, '').replace(/-class-.*$/, '');
-
-  const candDocIds = Array.from(new Set([
-    assignmentId,
-    `as-${assignBaseId}-class-${classKey}`,
-    `as-${assignBaseId}-class-lp${classKey}`,
-    originalAssignmentId
-  ].filter(Boolean) as string[]));
+  const candDocIds = getCandidateAssignmentIds({
+    id: assignmentId,
+    originalAssignmentId,
+    targetClass
+  });
 
   let deletedCount = 0;
 
   if (db) {
+    // 1. Xóa trong assignments/{docId}/submissions, assignments/{docId}, exams/{docId}/submissions, exams/{docId}
     for (const docId of candDocIds) {
+      // 1A. Subcollection assignments/{docId}/submissions
       try {
         const subColRef = collection(db, 'assignments', docId, 'submissions');
         const subSnap = await getDocs(subColRef);
@@ -473,22 +503,7 @@ export async function resetOrDeleteStudentAssignmentSubmission(
         const deletePromises: Promise<any>[] = [];
         subSnap.forEach((docSnap) => {
           const data = docSnap.data();
-          const docCode = normalizeStudentCode(data.studentCode || data.code || data.maHs || data.studentId || '');
-          const docIdStr = docSnap.id.toLowerCase();
-          const targetLower = normCode.toLowerCase();
-
-          const isIdMatch = docIdStr === targetLower ||
-                            docIdStr.startsWith(`${targetLower}_`) ||
-                            docIdStr.startsWith(`sub-${docId.toLowerCase()}-${targetLower}`) ||
-                            docIdStr.includes(targetLower);
-
-          const isCodeMatch = Boolean(docCode && docCode === normCode);
-          const isNameMatch = Boolean(
-            normName && 
-            normalizeStudentName(data.studentName || data.name || '') === normName
-          );
-
-          if (isIdMatch || isCodeMatch || isNameMatch) {
+          if (isMatchingStudentCode(normCode, data, docSnap.id)) {
             deletePromises.push(
               deleteDoc(doc(db, 'assignments', docId, 'submissions', docSnap.id))
                 .then(() => { deletedCount++; })
@@ -497,131 +512,162 @@ export async function resetOrDeleteStudentAssignmentSubmission(
           }
         });
 
+        // Xóa trực tiếp các docId cố định
         deletePromises.push(deleteDoc(doc(db, 'assignments', docId, 'submissions', normCode)).catch(() => {}));
+        deletePromises.push(deleteDoc(doc(db, 'assignments', docId, 'submissions', normCode.toLowerCase())).catch(() => {}));
+        deletePromises.push(deleteDoc(doc(db, 'assignments', docId, 'submissions', `${normCode}_${docId}`)).catch(() => {}));
         deletePromises.push(deleteDoc(doc(db, 'assignments', docId, 'submissions', `${normCode}_${docId}_1`)).catch(() => {}));
         deletePromises.push(deleteDoc(doc(db, 'assignments', docId, 'submissions', `sub-${docId}-${normCode}`)).catch(() => {}));
 
-        await Promise.all(deletePromises);
+        await Promise.allSettled(deletePromises);
+      } catch (subErr) {
+        console.warn(`Lỗi xóa subcollection assignments/${docId}/submissions:`, subErr);
+      }
 
+      // 1B. Master document assignments/{docId}
+      try {
         const masterRef = doc(db, 'assignments', docId);
         const masterSnap = await getDoc(masterRef);
         if (masterSnap.exists()) {
-          const masterData = masterSnap.data();
+          const masterData = masterSnap.data() || {};
+          let shouldUpdateMaster = false;
+          const updateMasterPayload: Record<string, any> = {
+            updatedAt: new Date().toISOString()
+          };
+
           if (Array.isArray(masterData.submissions)) {
             const filteredSubs = masterData.submissions.filter((s: any) => {
               if (!s) return false;
-              const sCode = normalizeStudentCode(s.studentCode || s.code || s.maHs || s.studentId || '');
-              const sId = String(s.id || '').toLowerCase();
-              const sName = normalizeStudentName(s.studentName || s.name || '');
-
-              if (sCode === normCode) return false;
-              if (sId.includes(normCode.toLowerCase())) return false;
-              if (normName && sName === normName) return false;
-              return true;
+              return !isMatchingStudentCode(normCode, s, s.id);
             });
-
-            const uniqueStudentKeys = new Set(
-              filteredSubs.map((s: any) => (s.studentId || s.studentCode || s.maHs || s.studentName || '').trim().toLowerCase()).filter(Boolean)
+            if (filteredSubs.length !== masterData.submissions.length) {
+              shouldUpdateMaster = true;
+              deletedCount++;
+            }
+            const uniqueStudentCodes = Array.from(
+              new Set(
+                filteredSubs
+                  .map((s: any) => extractCleanStudentCode(s, s?.id))
+                  .filter(Boolean)
+              )
             );
-            const count = uniqueStudentKeys.size;
+            updateMasterPayload.submissions = filteredSubs;
+            updateMasterPayload.submittedIds = uniqueStudentCodes;
+            updateMasterPayload.completedCount = uniqueStudentCodes.length;
+            updateMasterPayload.submittedCount = uniqueStudentCodes.length;
+          } else if (Array.isArray(masterData.submittedIds)) {
+            const filteredIds = masterData.submittedIds.filter(
+              (id: any) => !isMatchingStudentCode(normCode, { studentCode: String(id || '') }, String(id || ''))
+            );
+            if (filteredIds.length !== masterData.submittedIds.length) {
+              shouldUpdateMaster = true;
+              updateMasterPayload.submittedIds = filteredIds;
+              updateMasterPayload.completedCount = filteredIds.length;
+              updateMasterPayload.submittedCount = filteredIds.length;
+            }
+          }
 
-            await updateDoc(masterRef, {
-              submissions: filteredSubs,
-              submittedIds: Array.from(uniqueStudentKeys),
-              completedCount: count,
-              submittedCount: count,
-              updatedAt: new Date().toISOString()
+          if (shouldUpdateMaster) {
+            await updateDoc(masterRef, updateMasterPayload).catch((uErr) => {
+              console.warn(`Lỗi cập nhật master doc assignments/${docId}:`, uErr);
             });
           }
         }
-      } catch (err: any) {
-        console.error(`Lỗi khi dọn dẹp Firestore cho assignment ${docId}:`, err);
-        throw new Error(`Lỗi cơ sở dữ liệu: ${err?.message || 'Không thể xóa bài làm'}`);
+      } catch (masterErr) {
+        console.warn(`Lỗi đọc/cập nhật assignments/${docId}:`, masterErr);
       }
-    }
 
-    try {
-      const srDocRef = doc(db, 'student_results', normCode);
-      const srSnap = await getDoc(srDocRef);
-      if (srSnap.exists()) {
-        const data = srSnap.data();
-        const assignmentsMap = data.assignments || {};
-        let modified = false;
-        for (const docId of candDocIds) {
-          if (assignmentsMap[docId]) {
-            delete assignmentsMap[docId];
-            modified = true;
+      // 1C. Subcollection exams/{docId}/submissions & master doc exams/{docId} (do StudentExamModule lưu song song)
+      try {
+        const exSubColRef = collection(db, 'exams', docId, 'submissions');
+        const exSubSnap = await getDocs(exSubColRef);
+        const exDeletePromises: Promise<any>[] = [];
+
+        exSubSnap.forEach((docSnap) => {
+          const data = docSnap.data();
+          if (isMatchingStudentCode(normCode, data, docSnap.id)) {
+            exDeletePromises.push(
+              deleteDoc(doc(db, 'exams', docId, 'submissions', docSnap.id))
+                .then(() => { deletedCount++; })
+                .catch(() => {})
+            );
+          }
+        });
+
+        exDeletePromises.push(deleteDoc(doc(db, 'exams', docId, 'submissions', normCode)).catch(() => {}));
+        exDeletePromises.push(deleteDoc(doc(db, 'exams', docId, 'submissions', `${normCode}_${docId}`)).catch(() => {}));
+        exDeletePromises.push(deleteDoc(doc(db, 'exams', docId, 'submissions', `${normCode}_${docId}_1`)).catch(() => {}));
+        exDeletePromises.push(deleteDoc(doc(db, 'exams', docId, 'submissions', `sub-${docId}-${normCode}`)).catch(() => {}));
+
+        await Promise.allSettled(exDeletePromises);
+
+        const exMasterRef = doc(db, 'exams', docId);
+        const exMasterSnap = await getDoc(exMasterRef);
+        if (exMasterSnap.exists()) {
+          const exData = exMasterSnap.data() || {};
+          if (Array.isArray(exData.submissions)) {
+            const filteredExSubs = exData.submissions.filter((s: any) => {
+              if (!s) return false;
+              return !isMatchingStudentCode(normCode, s, s.id);
+            });
+            if (filteredExSubs.length !== exData.submissions.length) {
+              await updateDoc(exMasterRef, {
+                submissions: filteredExSubs,
+                updatedAt: new Date().toISOString()
+              }).catch(() => {});
+            }
           }
         }
-        if (modified) {
-          await updateDoc(srDocRef, {
-            assignments: assignmentsMap,
-            updatedAt: new Date().toISOString()
-          });
-        }
-      }
-    } catch (srErr) {
-      console.warn('Lỗi cập nhật student_results khi xóa bài tập:', srErr);
-    }
-  }
+      } catch {}
 
-  if (typeof window !== 'undefined') {
+      // 1D. Xóa bản nháp exam_drafts và exam_progress nếu có
+      await deleteExamDraft(normCode, docId).catch(() => {});
+      try {
+        await deleteDoc(doc(db, 'exam_drafts', `${normCode}_${docId}`));
+      } catch {}
+      try {
+        await deleteDoc(doc(db, 'exam_progress', `${normCode}_${docId}`));
+      } catch {}
+    }
+
+    // 2. Xóa toàn diện trong collection `student_results` theo `studentCode` & `targetId` / `assignmentId`
     try {
-      const studentKeys = [normCode, studentId, studentCode].filter(Boolean) as string[];
-      studentKeys.forEach(k => {
-        localStorage.removeItem(`eduplay_k4_student_submissions_${k}`);
+      const srDeleted = await studentResultService.deleteAssignmentSubmissionByStudentCode(normCode, {
+        id: assignmentId,
+        originalAssignmentId,
+        targetClass,
+        title
       });
-
-      const allSubsRaw = localStorage.getItem('eduplay_k4_all_assignment_submissions');
-      if (allSubsRaw) {
-        const allSubs = JSON.parse(allSubsRaw);
-        if (Array.isArray(allSubs)) {
-          const filtered = allSubs.filter((s: any) => {
-            const sCode = normalizeStudentCode(s.studentCode || s.code || s.maHs || s.studentId || '');
-            const sAssignmentId = String(s.assignmentId || s.id || '').trim();
-            const isMatch = candDocIds.some(cid => sAssignmentId.includes(cid));
-            if (sCode === normCode && isMatch) return false;
-            return true;
-          });
-          localStorage.setItem('eduplay_k4_all_assignment_submissions', JSON.stringify(filtered));
-        }
-      }
-
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (k && k.startsWith('eduplay_k4_student_submissions_')) {
-          const raw = localStorage.getItem(k);
-          if (raw) {
-            try {
-              const parsed = JSON.parse(raw);
-              if (Array.isArray(parsed)) {
-                const cleaned = parsed.filter((item: any) => {
-                  const itemAssignId = String(item.assignmentId || item.id || '');
-                  const itemCode = normalizeStudentCode(item.studentCode || item.code || item.maHs || item.studentId || '');
-                  const isMatch = candDocIds.some(cid => itemAssignId.includes(cid));
-                  if (itemCode === normCode && isMatch) return false;
-                  return true;
-                });
-                localStorage.setItem(k, JSON.stringify(cleaned));
-              }
-            } catch {}
-          }
-        }
-      }
-    } catch (lsErr) {
-      console.warn('Lỗi dọn LocalStorage khi xóa bài tập:', lsErr);
+      deletedCount += srDeleted;
+    } catch (srErr) {
+      console.warn('Lỗi xóa trong student_results:', srErr);
     }
   }
 
+  // 3. Dọn sạch LocalStorage cho mã học sinh và bài tập này
+  cleanLocalStorageSubmissionsForStudent(normCode, [rawInputCode, studentId, studentCode], candDocIds);
+
+  // 4. Xóa cache bộ nhớ và IndexedDB của bảng theo dõi nộp bài
   try {
     invalidateAllSubmissionsCache();
+    clearMemoryTrackingData();
+    await clearIndexedDBTrackingData();
   } catch {}
 
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new Event('eduplay_student_submissions_updated'));
+    window.dispatchEvent(new Event('eduplay_exam_submissions_updated'));
     window.dispatchEvent(new Event('eduplay_assignments_updated'));
     window.dispatchEvent(new Event('storage'));
+    window.dispatchEvent(new CustomEvent('eduplay_submission_reset', {
+      detail: {
+        studentCode: normCode,
+        assignmentId,
+        candDocIds
+      }
+    }));
   }
 
   return { success: true, deletedCount };
 }
+

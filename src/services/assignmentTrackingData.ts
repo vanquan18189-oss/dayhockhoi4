@@ -1,8 +1,9 @@
-import { doc, getDoc, collection, getDocs } from 'firebase/firestore';
+import { doc, getDoc } from 'firebase/firestore';
 import { db } from '../firebase';
 import { HomeworkAssignment, StudentRecord } from '../types';
-import { getStudentsFromLocalStorage, generateDefaultClassRoster } from './studentStorageService';
+import { getStudentsFromLocalStorage, generateDefaultClassRoster, fetchClassStudentsFromFirestore } from './studentStorageService';
 import { formatSubmissionDateTime, getCurrentSubmissionTimestamp } from '../utils/scoreUtils';
+import { studentResultService, extractCleanStudentCode } from './studentResultService';
 
 export const STANDARD_STUDENT_CODE_REGEX = /^[1-5][A-Z]\d{2}-\d{2}-[1-9]\d{0,2}$/;
 
@@ -177,7 +178,6 @@ export async function clearIndexedDBTrackingData(assignmentId?: string): Promise
 export function parseDurationToSeconds(submission: any): number {
   if (!submission) return 0;
 
-  // 1. Numeric seconds if directly provided
   if (typeof submission.durationSeconds === 'number' && submission.durationSeconds > 0) {
     return submission.durationSeconds;
   }
@@ -188,7 +188,6 @@ export function parseDurationToSeconds(submission: any): number {
     return submission.duration;
   }
 
-  // 2. String format like "2 phút 21 giây" or "3p 15s" or "10 phút"
   const str = String(submission.duration || submission.timeTaken || submission.submittedTime || '');
   const minMatch = str.match(/(\d+)\s*(?:phút|p|m)/i);
   const secMatch = str.match(/(\d+)\s*(?:giây|s)/i);
@@ -220,14 +219,11 @@ export function formatDurationDisplay(seconds: number, fallbackTimeStr = ''): st
  */
 export function normalizeStudentCodeStrict(raw?: string): string {
   if (!raw || typeof raw !== 'string') return '';
-  return raw.replace(/\s+/g, '').toUpperCase();
+  return raw.trim().replace(/\s+/g, '').toUpperCase();
 }
 
 /**
- * Parse submission timestamp supporting both:
- * 1. Vietnamese string format: "17:42 27/10/2026", "06:56 24/10/2026", "07:44, 28/10/2026"
- * 2. ISO date format: "2026-11-08T12:49:34.541Z"
- * Returns epoch timestamp (ms). If invalid/empty, returns Number.MAX_SAFE_INTEGER so it ranks after earlier/valid submissions.
+ * Parse submission timestamp
  */
 export function parseSubmissionTimestamp(timeStr?: string): number {
   if (!timeStr || typeof timeStr !== 'string') return Number.MAX_SAFE_INTEGER;
@@ -262,7 +258,7 @@ export function parseSubmissionTimestamp(timeStr?: string): number {
     if (!isNaN(timeVal)) return timeVal;
   }
 
-  // 3. ISO or standard format: "2026-11-08T12:49:34.541Z"
+  // 3. ISO or standard format
   const isoTime = new Date(trimmed).getTime();
   if (!isNaN(isoTime)) {
     return isoTime;
@@ -276,7 +272,7 @@ export function parseSubmissionTimestamp(timeStr?: string): number {
  */
 export function extractSubmissionNumericScore(submission: any, questionCount = 5): number {
   if (!submission) return 0;
-  
+
   if (typeof submission.numericScore === 'number' && !isNaN(submission.numericScore)) {
     return submission.numericScore;
   }
@@ -300,7 +296,10 @@ export function extractSubmissionNumericScore(submission: any, questionCount = 5
     const num = parseFloat(submission.score.replace(/\s*\/.*$/, '').trim());
     if (!isNaN(num)) return num;
   }
-  const rawAnswers = submission.answers || submission.studentAnswers || submission.answersById;
+  if (typeof submission.lastAttempt?.score === 'number' && !isNaN(submission.lastAttempt.score)) {
+    return submission.lastAttempt.score;
+  }
+  const rawAnswers = submission.answers || submission.lastAttempt?.answers || submission.studentAnswers || submission.answersById;
   if (rawAnswers && questionCount > 0) {
     let passCount = 0;
     if (Array.isArray(rawAnswers)) {
@@ -315,21 +314,26 @@ export function extractSubmissionNumericScore(submission: any, questionCount = 5
 
 /**
  * Compare two submissions of the same student:
- * - Giữ bản có điểm cao nhất
- * - Bằng điểm thì giữ bản nộp sớm hơn
+ * - Ưu tiên bản có câu trả lời chi tiết (answers) và điểm cao nhất
  */
 export function isBetterSubmission(subNew: any, subCurrent: any, questionCount = 5): boolean {
   if (!subCurrent) return true;
   if (!subNew) return false;
 
+  const ansNew = subNew.answers || subNew.lastAttempt?.answers || {};
+  const ansCur = subCurrent.answers || subCurrent.lastAttempt?.answers || {};
+  const countNew = typeof ansNew === 'object' && ansNew !== null ? Object.keys(ansNew).length : 0;
+  const countCur = typeof ansCur === 'object' && ansCur !== null ? Object.keys(ansCur).length : 0;
+
+  if (countNew > 0 && countCur === 0) return true;
+  if (countCur > 0 && countNew === 0) return false;
+
   const scoreNew = extractSubmissionNumericScore(subNew, questionCount);
   const scoreCurrent = extractSubmissionNumericScore(subCurrent, questionCount);
 
-  // 1. Điểm cao nhất
   if (scoreNew > scoreCurrent) return true;
   if (scoreNew < scoreCurrent) return false;
 
-  // 2. Bằng điểm thì giữ bản nộp sớm hơn
   const timeNew = parseSubmissionTimestamp(subNew.submittedAt || subNew.submittedTime);
   const timeCurrent = parseSubmissionTimestamp(subCurrent.submittedAt || subCurrent.submittedTime);
 
@@ -345,11 +349,9 @@ export interface ComputeTrackingOptions {
 /**
  * Core shared function to compute tracking rows for any assignment and class roster.
  * Strictly adheres to:
- * - Matches submissions to students via studentCode (normalized uppercase, no spaces)
- * - If no studentCode, fallback to studentId
- * - TUYỆT ĐỐI KHÔNG ghép bằng họ tên
- * - Validates standard code format ^[1-5][A-Z]\d{2}-\d{2}-[1-9]\d{0,2}$
- * - Flags duplicate codes without merging them
+ * - Matches submissions to students EXCLUSIVELY via studentCode (normalized uppercase, trimmed, no spaces)
+ * - TUYỆT ĐỐI KHÔNG đối chiếu hay lọc bỏ theo tên học sinh
+ * - Nếu danh sách lớp trống (0 học sinh) hoặc chưa đồng bộ, VẪN HIỂN THỊ ĐẦY ĐỦ tất cả các mã học sinh đã nộp bài
  */
 export function computeAssignmentTrackingData({
   assignment,
@@ -368,28 +370,25 @@ export function computeAssignmentTrackingData({
     };
   }
 
-  const targetClassName = assignment.targetClass || 'Lớp 4A';
+  const targetClassName = assignment.targetClass || 'Lớp 4C';
 
   // 1. Get class roster
   let roster: StudentRecord[] = classRoster || [];
   if (!roster || roster.length === 0) {
-    roster = getStudentsFromLocalStorage(targetClassName) || generateDefaultClassRoster(targetClassName, 38);
+    roster = getStudentsFromLocalStorage(targetClassName) || generateDefaultClassRoster(targetClassName, 0);
   }
 
-  // 2. Count occurrences of codes in roster to detect duplicates
+  // 2. Count occurrences of codes in roster to detect duplicates & map roster by studentCode
   const codeOccurrences = new Map<string, number>();
-  const rosterNormCodes = new Set<string>();
-  const rosterNormIds = new Set<string>();
+  const rosterByCode = new Map<string, StudentRecord>();
   roster.forEach(st => {
-    const codeKey = normalizeStudentCodeStrict(st.code);
+    const codeKey = normalizeStudentCodeStrict(st.code || st.id);
     if (codeKey) {
       codeOccurrences.set(codeKey, (codeOccurrences.get(codeKey) || 0) + 1);
-      rosterNormCodes.add(codeKey);
+      if (!rosterByCode.has(codeKey)) {
+        rosterByCode.set(codeKey, st);
+      }
     }
-    const idKey = normalizeStudentCodeStrict(st.id);
-    if (idKey) rosterNormIds.add(idKey);
-    const userKey = normalizeStudentCodeStrict(st.username);
-    if (userKey) rosterNormIds.add(userKey);
   });
 
   // 3. Collect all submissions for this assignment
@@ -401,164 +400,197 @@ export function computeAssignmentTrackingData({
   const questions = assignment.questions || [];
   const questionCount = questions.length > 0 ? questions.length : 5;
 
-  // Map submissions strictly by studentCode, fallback to studentId (NEVER by name)
-  // For multiple submissions per student: keep highest score, earlier time if tied!
+  // Map submissions strictly by normalized studentCode (NEVER by studentName)
   const codeSubMap = new Map<string, any>();
-  const idSubMap = new Map<string, any>();
-  const unmatchedCodesSet = new Set<string>();
 
   allSubs.forEach(sub => {
     if (!sub) return;
+    const normCode = normalizeStudentCodeStrict(extractCleanStudentCode(sub));
+    if (!normCode) return;
 
-    let matchedWithRoster = false;
-
-    // Direct studentCode variants
-    const rawCodes = [sub.studentCode, sub.maHs, sub.code];
-    for (const c of rawCodes) {
-      if (c && typeof c === 'string') {
-        const norm = normalizeStudentCodeStrict(c);
-        if (norm) {
-          if (rosterNormCodes.has(norm) || rosterNormIds.has(norm)) {
-            matchedWithRoster = true;
-          }
-          const current = codeSubMap.get(norm);
-          if (!current || isBetterSubmission(sub, current, questionCount)) {
-            codeSubMap.set(norm, sub);
-          }
-        }
-      }
-    }
-
-    // Fallback studentId variants
-    const rawIds = [sub.studentId, sub.id, sub.userId, sub.username];
-    for (const id of rawIds) {
-      if (id && typeof id === 'string') {
-        const norm = normalizeStudentCodeStrict(id);
-        if (norm) {
-          if (rosterNormCodes.has(norm) || rosterNormIds.has(norm)) {
-            matchedWithRoster = true;
-          }
-          const current = idSubMap.get(norm);
-          if (!current || isBetterSubmission(sub, current, questionCount)) {
-            idSubMap.set(norm, sub);
-          }
-        }
-      }
-    }
-
-    if (!matchedWithRoster) {
-      const displayKey = (sub.studentCode || sub.maHs || sub.code || sub.studentId || sub.id || sub.studentName || '').trim();
-      if (displayKey) {
-        unmatchedCodesSet.add(normalizeStudentCodeStrict(displayKey));
-      }
+    const current = codeSubMap.get(normCode);
+    if (!current || isBetterSubmission(sub, current, questionCount)) {
+      codeSubMap.set(normCode, {
+        ...current,
+        ...sub,
+        studentCode: normCode,
+        answers:
+          sub.answers && Object.keys(sub.answers).length > 0
+            ? sub.answers
+            : sub.lastAttempt?.answers || current?.answers || {}
+      });
     }
   });
 
-  const unmatchedSubmissionsCount = unmatchedCodesSet.size;
   const LOW_SCORE_THRESHOLD = 5;
-
   let submittedCount = 0;
+  const processedCodes = new Set<string>();
 
-  // 4. Map roster to tracking rows (do not merge duplicate students)
-  const trackingList: TrackingStudentRow[] = roster.map((st, idx) => {
-    const stt = st.stt || idx + 1;
-    const stCode = st.code || `4A26-27-${stt}`;
-    const stName = st.name || st.fullName || `Học sinh ${stt}`;
-    const normCode = normalizeStudentCodeStrict(stCode);
-    const normId = normalizeStudentCodeStrict(st.id);
+  const buildSubmittedRow = (
+    stCode: string,
+    stName: string,
+    stt: number,
+    submission: any,
+    hasInvalidCodeFormat: boolean,
+    hasDuplicateCode: boolean
+  ): TrackingStudentRow => {
+    const rawAnswers =
+      submission.answers ||
+      submission.lastAttempt?.answers ||
+      submission.studentAnswers ||
+      submission.answersById;
 
-    const hasInvalidCodeFormat = !STANDARD_STUDENT_CODE_REGEX.test(stCode);
-    const hasDuplicateCode = normCode ? (codeOccurrences.get(normCode) || 0) > 1 : false;
-
-    // Strict matching: by studentCode first, fallback to studentId. NEVER by name!
-    let submission: any = null;
-    if (normCode && codeSubMap.has(normCode)) {
-      submission = codeSubMap.get(normCode);
-    } else if (normId && idSubMap.has(normId)) {
-      submission = idSubMap.get(normId);
-    }
-
-    if (submission) {
-      submittedCount++;
-
-      // Evaluated answers
-      const rawAnswers = submission.answers || submission.studentAnswers || submission.answersById;
-      const evaluatedAnswers: ('pass' | 'fail' | 'none')[] = Array.from({ length: questionCount }).map((_, qi) => {
-        let rawChoice: any = undefined;
-        if (Array.isArray(rawAnswers)) {
-          rawChoice = rawAnswers[qi];
-        } else if (rawAnswers && typeof rawAnswers === 'object') {
-          rawChoice = rawAnswers[qi] !== undefined ? rawAnswers[qi] : rawAnswers[String(qi)];
-        }
-
-        if (rawChoice === 'pass' || rawChoice === true || rawChoice === 'correct') return 'pass';
-        if (rawChoice === 'fail' || rawChoice === false || rawChoice === 'incorrect') return 'fail';
-
-        const preEvaluated = submission.questionResults || submission.results || submission.gradedAnswers;
-        if (Array.isArray(preEvaluated) && preEvaluated[qi] !== undefined) {
-          const p = preEvaluated[qi];
-          if (typeof p === 'boolean') return p ? 'pass' : 'fail';
-          if (p === 'pass' || p === 'fail') return p;
-          if (p && typeof p === 'object' && p.isCorrect !== undefined) return p.isCorrect ? 'pass' : 'fail';
-        }
-        return 'pass'; // default fallback for submitted answer
-      });
-
-      const correctCount = evaluatedAnswers.filter(a => a === 'pass').length;
-      const computedScore = questionCount > 0 ? Math.round((correctCount / questionCount) * 10) : 0;
-
-      const rawScore = submission.score !== undefined ? submission.score : (submission.totalScore !== undefined ? submission.totalScore : '-');
-      let finalScore: number | string = computedScore;
-      if (rawScore !== undefined && rawScore !== null && rawScore !== '-' && rawScore !== '') {
-        const num = typeof rawScore === 'number' ? rawScore : parseFloat(String(rawScore));
-        if (!isNaN(num)) finalScore = num;
+    const evaluatedAnswers: ('pass' | 'fail' | 'none')[] = Array.from({ length: questionCount }).map((_, qi) => {
+      const q = questions[qi];
+      let rawChoice: any = undefined;
+      if (Array.isArray(rawAnswers)) {
+        rawChoice = rawAnswers[qi];
+      } else if (rawAnswers && typeof rawAnswers === 'object') {
+        rawChoice =
+          rawAnswers[qi] !== undefined
+            ? rawAnswers[qi]
+            : rawAnswers[String(qi)] !== undefined
+            ? rawAnswers[String(qi)]
+            : q?.id
+            ? rawAnswers[q.id]
+            : undefined;
+      }
+      if (rawChoice === undefined && submission.answersById && q?.id) {
+        rawChoice = submission.answersById[q.id];
       }
 
-      const numericScoreVal = typeof finalScore === 'number' ? finalScore : (parseFloat(String(finalScore)) || 0);
-      const isPassed = numericScoreVal >= LOW_SCORE_THRESHOLD;
+      if (rawChoice === 'pass' || rawChoice === true || rawChoice === 'correct') return 'pass';
+      if (rawChoice === 'fail' || rawChoice === false || rawChoice === 'incorrect') return 'fail';
 
-      const durationSecs = parseDurationToSeconds(submission);
-      const displayDuration = formatDurationDisplay(durationSecs, submission.duration || submission.timeTaken);
+      const preEvaluated = submission.questionResults || submission.results || submission.gradedAnswers;
+      if (Array.isArray(preEvaluated) && preEvaluated[qi] !== undefined) {
+        const p = preEvaluated[qi];
+        if (typeof p === 'boolean') return p ? 'pass' : 'fail';
+        if (p === 'pass' || p === 'fail') return p;
+        if (p && typeof p === 'object' && p.isCorrect !== undefined) return p.isCorrect ? 'pass' : 'fail';
+      }
 
-      return {
-        code: stCode,
-        name: stName,
-        stt,
-        answers: evaluatedAnswers,
-        totalScore: finalScore,
-        numericScore: numericScoreVal,
-        aiStatus: isPassed ? ('pass' as const) : ('fail' as const),
-        submittedTime: formatSubmissionDateTime(submission.submittedAt || submission.submittedTime || getCurrentSubmissionTimestamp()),
-        durationSeconds: durationSecs,
-        displayTime: displayDuration,
-        status: 'submitted' as const,
-        rawSubmission: submission,
-        hasOrangeAlert: false,
-        hasRedAlert: numericScoreVal < LOW_SCORE_THRESHOLD,
-        hasInvalidCodeFormat,
-        hasDuplicateCode
-      };
-    } else {
-      return {
-        code: stCode,
-        name: stName,
-        stt,
-        answers: Array.from({ length: questionCount }).map(() => 'none' as const),
-        totalScore: '-',
-        numericScore: -1,
-        aiStatus: 'none' as const,
-        submittedTime: 'Chờ HS',
-        status: 'waiting' as const,
-        hasInvalidCodeFormat,
-        hasDuplicateCode
-      };
+      if (q && rawChoice !== undefined && rawChoice !== null && rawChoice !== '') {
+        // Basic comparison against correctOptionIndex / correctAnswer if present
+        if (typeof q.correctOptionIndex === 'number' && Number(rawChoice) === q.correctOptionIndex) {
+          return 'pass';
+        }
+        if (q.correctAnswer !== undefined && String(rawChoice).trim() === String(q.correctAnswer).trim()) {
+          return 'pass';
+        }
+      }
+
+      return rawChoice !== undefined && rawChoice !== null && rawChoice !== '' ? 'pass' : 'fail';
+    });
+
+    const correctCount = evaluatedAnswers.filter(a => a === 'pass').length;
+    const computedScore = questionCount > 0 ? Math.round((correctCount / questionCount) * 10) : 0;
+
+    const rawScore =
+      submission.score !== undefined
+        ? submission.score
+        : submission.totalScore !== undefined
+        ? submission.totalScore
+        : submission.lastAttempt?.score !== undefined
+        ? submission.lastAttempt.score
+        : '-';
+    let finalScore: number | string = computedScore;
+    if (rawScore !== undefined && rawScore !== null && rawScore !== '-' && rawScore !== '') {
+      const num = typeof rawScore === 'number' ? rawScore : parseFloat(String(rawScore).replace(/\s*\/.*$/, '').trim());
+      if (!isNaN(num)) finalScore = num;
     }
+
+    const numericScoreVal = typeof finalScore === 'number' ? finalScore : (parseFloat(String(finalScore)) || 0);
+    const isPassed = numericScoreVal >= LOW_SCORE_THRESHOLD;
+
+    const durationSecs = parseDurationToSeconds(submission);
+    const displayDuration = formatDurationDisplay(durationSecs, submission.duration || submission.timeTaken);
+
+    return {
+      code: stCode,
+      name: stName,
+      stt,
+      answers: evaluatedAnswers,
+      totalScore: finalScore,
+      numericScore: numericScoreVal,
+      aiStatus: isPassed ? ('pass' as const) : ('fail' as const),
+      submittedTime: formatSubmissionDateTime(
+        submission.submittedAt ||
+          submission.submittedTime ||
+          submission.lastAttempt?.submittedAt ||
+          getCurrentSubmissionTimestamp()
+      ),
+      durationSeconds: durationSecs,
+      displayTime: displayDuration,
+      status: 'submitted' as const,
+      rawSubmission: submission,
+      hasOrangeAlert: false,
+      hasRedAlert: numericScoreVal < LOW_SCORE_THRESHOLD,
+      hasInvalidCodeFormat,
+      hasDuplicateCode
+    };
+  };
+
+  // 4. Map roster to tracking rows (matching strictly by studentCode)
+  const trackingList: TrackingStudentRow[] = roster.map((st, idx) => {
+    const stt = st.stt || idx + 1;
+    const stCode = normalizeStudentCodeStrict(st.code || st.id) || `4C26-27-${stt}`;
+    const stName = st.name || st.fullName || `Học sinh (${stCode})`;
+    processedCodes.add(stCode);
+
+    const hasInvalidCodeFormat = !STANDARD_STUDENT_CODE_REGEX.test(stCode);
+    const hasDuplicateCode = (codeOccurrences.get(stCode) || 0) > 1;
+
+    const submission = codeSubMap.get(stCode) || null;
+    if (submission) {
+      submittedCount++;
+      return buildSubmittedRow(stCode, stName, stt, submission, hasInvalidCodeFormat, hasDuplicateCode);
+    }
+
+    return {
+      code: stCode,
+      name: stName,
+      stt,
+      answers: Array.from({ length: questionCount }).map(() => 'none' as const),
+      totalScore: '-',
+      numericScore: -1,
+      aiStatus: 'none' as const,
+      submittedTime: 'Chờ HS',
+      status: 'waiting' as const,
+      hasInvalidCodeFormat,
+      hasDuplicateCode
+    };
+  });
+
+  // 5. Append any submitted studentCode that was NOT in the local class roster
+  // (e.g., when class roster has 0 students or hasn't synced yet, or studentCode is new)
+  let unmatchedSubmissionsCount = 0;
+  codeSubMap.forEach((submission, normCode) => {
+    if (processedCodes.has(normCode)) return;
+    processedCodes.add(normCode);
+    unmatchedSubmissionsCount++;
+    submittedCount++;
+
+    const stt = trackingList.length + 1;
+    const rosterMatch = rosterByCode.get(normCode);
+    const displayName =
+      rosterMatch?.name ||
+      rosterMatch?.fullName ||
+      submission.studentName ||
+      submission.name ||
+      submission.fullName ||
+      `Học sinh (${normCode})`;
+    const hasInvalidCodeFormat = !STANDARD_STUDENT_CODE_REGEX.test(normCode);
+
+    trackingList.push(
+      buildSubmittedRow(normCode, displayName, stt, submission, hasInvalidCodeFormat, false)
+    );
   });
 
   return {
     assignmentId: assignment.id,
     targetClass: targetClassName,
-    totalStudents: roster.length,
+    totalStudents: trackingList.length,
     submittedCount,
     unmatchedSubmissionsCount,
     trackingList,
@@ -567,13 +599,7 @@ export function computeAssignmentTrackingData({
 }
 
 /**
- * Fetch tracking data once for an assignment (used by Bảng Vàng & Theo dõi nộp bài)
- * - If in memory: return immediately (0 reads)
- * - If in IndexedDB and < 10 mins: return immediately (0 reads)
- * - If not in cache or forceRefresh:
- *   Fetch ONE TIME from Firestore for both assignment doc & submissions subcollection,
- *   cache to IndexedDB and memory, then return.
- * - Does NOT use onSnapshot, does NOT use localStorage for caching.
+ * Fetch tracking data for an assignment (used by Bảng Vàng & Theo dõi nộp bài)
  */
 export async function getOrFetchAssignmentTrackingData(
   assignment: HomeworkAssignment,
@@ -583,52 +609,59 @@ export async function getOrFetchAssignmentTrackingData(
     throw new Error('Thiếu thông tin bài tập');
   }
 
-  // 1. Check in-memory cache first
   if (!forceRefresh) {
     const memoryData = getMemoryTrackingData(assignment.id);
-    if (memoryData) {
+    if (memoryData && memoryData.trackingList.length > 0) {
       return memoryData;
     }
 
-    // 2. Check IndexedDB cache
     const idbData = await getIndexedDBTrackingData(assignment.id);
-    if (idbData) {
+    if (idbData && idbData.trackingList.length > 0) {
       setMemoryTrackingData(assignment.id, idbData);
       return idbData;
     }
   }
 
-  // 3. One-time read from Firestore (doc + subcollection)
   let freshAssignment = assignment;
   let fetchedSubmissions: any[] = [];
+  let classRoster: StudentRecord[] = getStudentsFromLocalStorage(assignment.targetClass || 'Lớp 4C') || [];
 
   if (db && assignment.id) {
     try {
-      // 3.1 Fetch parent assignment doc
       const assignRef = doc(db, 'assignments', assignment.id);
       const assignSnap = await getDoc(assignRef);
       if (assignSnap.exists()) {
         freshAssignment = { id: assignSnap.id, ...assignSnap.data() } as HomeworkAssignment;
       }
-
-      // 3.2 Fetch submissions subcollection
-      const subsCollRef = collection(db, 'assignments', assignment.id, 'submissions');
-      const subsSnap = await getDocs(subsCollRef);
-      fetchedSubmissions = subsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
     } catch (err) {
-      console.warn('[TrackingData] Lỗi đọc Firestore (dùng fallback an toàn):', err);
+      console.warn('[TrackingData] Lỗi đọc assignment doc:', err);
+    }
+
+    try {
+      fetchedSubmissions = await studentResultService.fetchAssignmentSubmissionsByStudentCode(freshAssignment);
+    } catch (err) {
+      console.warn('[TrackingData] Lỗi đọc bài nộp từ Firestore:', err);
+    }
+
+    if (!classRoster || classRoster.length === 0) {
+      try {
+        const fsRoster = await fetchClassStudentsFromFirestore(freshAssignment.targetClass || 'Lớp 4C');
+        if (fsRoster && fsRoster.length > 0) {
+          classRoster = fsRoster;
+        }
+      } catch {}
     }
   }
 
-  // 4. Compute full tracking data with authentic roster and strict matching
   const computed = computeAssignmentTrackingData({
     assignment: freshAssignment,
-    submissionsList: fetchedSubmissions
+    submissionsList: fetchedSubmissions,
+    classRoster
   });
 
-  // 5. Cache into Memory & IndexedDB (10 minutes)
   setMemoryTrackingData(assignment.id, computed);
   await setIndexedDBTrackingData(assignment.id, computed);
 
   return computed;
 }
+
