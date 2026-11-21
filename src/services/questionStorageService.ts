@@ -21,15 +21,19 @@ export function isQuestionMatchingGrade(questionGrade?: string, filterGrade?: st
   return questionGrade.toLowerCase().includes(filterGrade.toLowerCase()) || filterGrade.toLowerCase().includes(questionGrade.toLowerCase());
 }
 
-import { db, auth, isFirestoreQuotaExceeded, markFirestoreQuotaExceeded } from './firebase';
+import { db, auth } from './firebase';
 import {
   collection,
   doc,
+  setDoc,
+  addDoc,
+  deleteDoc,
+  writeBatch,
   getDocs,
   getDocFromServer
 } from 'firebase/firestore';
 import { trackedSetDoc, trackedDeleteDoc, trackedWriteBatch } from './firestoreWriteTracker';
-import { INITIAL_QUESTIONS } from './mockData';
+import { sanitizeForFirestore } from '../utils/firestoreSanitizer';
 import { waitForWriteConfirmation, updateCollectionCacheStatus } from './firestoreWriteVerificationService';
 import {
   getScopedDocs,
@@ -41,6 +45,42 @@ import {
 
 export const QUESTIONS_CACHE_KEY = 'eduplay_k4_questions_database_cache';
 export const QUESTIONS_COLLECTION = 'questions';
+export const SAMPLE_QUESTION_IDS = new Set([
+  'q_k4_01',
+  'q_k4_02',
+  'q_k4_03',
+  'q_k4_04',
+  'q_k4_05',
+  'q_k4_06'
+]);
+
+export function isSampleQuestionId(id?: string): boolean {
+  if (!id) return false;
+  const clean = id.trim();
+  return SAMPLE_QUESTION_IDS.has(clean) || /^q_k4_0[1-6]$/i.test(clean);
+}
+
+/**
+ * Xóa triệt để 6 câu hỏi dữ liệu mẫu (q_k4_01 đến q_k4_06) khỏi Firestore và bộ nhớ cục bộ
+ */
+export async function purgeSampleQuestionsFromFirestore(): Promise<void> {
+  try {
+    const cached = getLocalCachedQuestions();
+    const filtered = cached.filter((q) => !isSampleQuestionId(q?.id));
+    if (filtered.length !== cached.length) {
+      saveLocalCachedQuestions(filtered);
+    }
+
+    if (!db) return;
+    for (const sampleId of Array.from(SAMPLE_QUESTION_IDS)) {
+      try {
+        await deleteDoc(doc(db, QUESTIONS_COLLECTION, sampleId));
+      } catch {}
+    }
+  } catch (e) {
+    console.warn('Cảnh báo khi dọn câu hỏi mẫu q_k4_01..q_k4_06:', e);
+  }
+}
 
 export enum FirestoreOpType {
   CREATE = 'create',
@@ -121,7 +161,7 @@ export function sanitizeQuestionForFirestore(q: QuestionItem): QuestionItem {
   const safeId = q.id || `q-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
   let qType = q.type || 'multiple_choice';
   const hasMatchingPairs = Array.isArray(q.matchingPairs) && q.matchingPairs.length > 0;
-  const contentLower = (q.content || '').toLowerCase();
+  const contentLower = (q.content || q.questionText || '').toLowerCase();
   const hasMatchingKeywords = contentLower.includes('cột a') && contentLower.includes('cột b') || contentLower.includes('nối') || contentLower.includes('ghép cặp');
   const isMatchingType = qType === 'matching' || qType === 'nối cặp' || qType === 'kéo thả' || hasMatchingPairs || hasMatchingKeywords;
   const hasStatements = Array.isArray(q.statements) && q.statements.length > 0;
@@ -140,22 +180,40 @@ export function sanitizeQuestionForFirestore(q: QuestionItem): QuestionItem {
     defaultCorrectAnswer = q.options.map((opt, i) => `${i + 1}. ${opt}`).join('\n');
   }
 
+  const identity = resolveTeacherIdentityForWrite({
+    teacherId: q.teacherId,
+    teacherEmail: q.teacherEmail,
+    teacherName: q.teacherName,
+    createdBy: q.createdBy
+  });
+
+  const cleanOptions = Array.isArray(q.options)
+    ? q.options.map((opt) => (typeof opt === 'string' ? opt.trim() : String(opt ?? ''))).filter(Boolean)
+    : [];
+
+  const nowTimestamp = q.createdAt || new Date().toISOString();
+
   const cleanQ: QuestionItem = {
     id: String(safeId),
     code: q.code || `CH-${(q.subject || 'TOAN').toUpperCase().slice(0, 3)}-${Date.now().toString().slice(-4)}`,
     subject: q.subject || 'Toán',
-    grade: q.grade || 'Khối 4',
+    grade: '4',
     level: q.level || 'nhan_biet',
     type: qType,
-    content: q.content || 'Nội dung câu hỏi',
-    lessonName: q.lessonName || 'Bài học',
+    content: (q.content || q.questionText || 'Nội dung câu hỏi').trim(),
+    options: cleanOptions,
+    lessonName: q.lessonName || q.topic || 'Bài học',
     correctAnswer: q.correctAnswer || defaultCorrectAnswer,
     explanation: q.explanation || 'Hướng dẫn sư phạm cho câu hỏi.',
+    teacherId: identity.teacherId || 'gv-12',
+    teacherEmail: identity.teacherEmail || 'thuthuthtk@gmail.com',
+    teacherName: q.teacherName || identity.teacherName || 'Giáo viên',
+    createdBy: identity.createdBy || identity.teacherId || 'gv-12',
+    authorName: q.authorName || identity.teacherName || 'Giáo viên',
+    authorType: q.authorType || 'my',
+    isShared: q.isShared !== undefined ? Boolean(q.isShared) : true,
+    createdAt: nowTimestamp
   };
-
-  if (Array.isArray(q.options) && q.options.length > 0) {
-    cleanQ.options = q.options.filter(Boolean);
-  }
 
   if (isOrdering) {
     const trueSequence = extractTrueOrderingFromQuestion(q);
@@ -192,27 +250,14 @@ export function sanitizeQuestionForFirestore(q: QuestionItem): QuestionItem {
     }));
   }
 
-  const identity = resolveTeacherIdentityForWrite({
-    teacherId: q.teacherId,
-    teacherEmail: q.teacherEmail,
-    teacherName: q.teacherName,
-    createdBy: q.createdBy
-  });
-
-  if (q.authorName) cleanQ.authorName = q.authorName;
-  else if (identity.teacherName) cleanQ.authorName = identity.teacherName;
-  if (q.authorType) cleanQ.authorType = q.authorType;
-  if (identity.teacherId) cleanQ.teacherId = identity.teacherId;
-  if (identity.teacherEmail) cleanQ.teacherEmail = identity.teacherEmail;
-  if (identity.createdBy) cleanQ.createdBy = identity.createdBy;
-  if (q.teacherName) cleanQ.teacherName = q.teacherName;
-  if (q.isShared !== undefined) cleanQ.isShared = Boolean(q.isShared);
+  if (q.imageUrl) cleanQ.imageUrl = q.imageUrl;
+  if (q.imagePrompt) cleanQ.imagePrompt = q.imagePrompt;
 
   return cleanQ;
 }
 
 /**
- * Retrieve cached questions from localStorage
+ * Retrieve cached questions from localStorage (automatically excluding 6 sample questions q_k4_01..q_k4_06)
  */
 export function getLocalCachedQuestions(): QuestionItem[] {
   let questions: QuestionItem[] = [];
@@ -221,7 +266,7 @@ export function getLocalCachedQuestions(): QuestionItem[] {
     if (raw) {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
-        questions = parsed;
+        questions = parsed.filter((q) => q && !isSampleQuestionId(q.id));
       }
     }
   } catch (e) {
@@ -260,64 +305,74 @@ export function getLocalCachedQuestions(): QuestionItem[] {
 }
 
 /**
- * Save questions to local cache
+ * Save questions to local cache (excluding 6 sample questions q_k4_01..q_k4_06)
  */
 export function saveLocalCachedQuestions(questions: QuestionItem[]): void {
   try {
-    localStorage.setItem(QUESTIONS_CACHE_KEY, JSON.stringify(questions));
+    const cleanList = (questions || []).filter((q) => q && !isSampleQuestionId(q.id));
+    localStorage.setItem(QUESTIONS_CACHE_KEY, JSON.stringify(cleanList));
   } catch (e) {
     console.warn('Could not write questions to localStorage', e);
   }
 }
 
 /**
- * Dispatch notification toast - Xóa bỏ hoàn toàn khối thông báo debug trên giao diện
+ * Dispatch notification toast
  */
-export function notifyQuestionSaved(_count: number = 1, _title?: string) {
-  // Không phát sự kiện thông báo debug ra giao diện
-}
-
-/**
- * Save a single question to Firestore & cache
- */
-export async function saveQuestionToFirestore(question: QuestionItem): Promise<void> {
-  const sanitized = sanitizeQuestionForFirestore(question);
-  const path = `${QUESTIONS_COLLECTION}/${sanitized.id}`;
-
-  try {
-    if (!db) {
-      const current = getLocalCachedQuestions();
-      const updated = current.some(q => q.id === sanitized.id)
-        ? current.map(q => (q.id === sanitized.id ? sanitized : q))
-        : [sanitized, ...current];
-      saveLocalCachedQuestions(updated);
-      return;
-    }
-
-    const docRef = doc(db, QUESTIONS_COLLECTION, sanitized.id);
-    await trackedSetDoc(docRef, sanitized);
-
-    // Update local cache
-    const current = getLocalCachedQuestions();
-    const updated = current.some(q => q.id === sanitized.id)
-      ? current.map(q => (q.id === sanitized.id ? sanitized : q))
-      : [sanitized, ...current];
-    saveLocalCachedQuestions(updated);
-  } catch (error) {
-    console.error('Error saving single question to Firestore:', error);
-    // Even if firestore errors, update cache
-    const current = getLocalCachedQuestions();
-    const updated = current.some(q => q.id === sanitized.id)
-      ? current.map(q => (q.id === sanitized.id ? sanitized : q))
-      : [sanitized, ...current];
-    saveLocalCachedQuestions(updated);
-
-    handleFirestoreError(error, FirestoreOpType.WRITE, path);
+export function notifyQuestionSaved(count: number = 1, _title?: string) {
+  if (typeof window !== 'undefined') {
+    try {
+      window.dispatchEvent(
+        new CustomEvent('eduplay_questions_updated', {
+          detail: { count, timestamp: Date.now() }
+        })
+      );
+    } catch {}
   }
 }
 
 /**
- * Save a batch of questions to Firestore (e.g. from AI Generation)
+ * Save a single question directly to Firestore collection `questions` & local cache
+ */
+export async function saveQuestionToFirestore(question: QuestionItem): Promise<void> {
+  const sanitized = sanitizeQuestionForFirestore(question);
+  const cleanPayload = sanitizeForFirestore(sanitized);
+
+  try {
+    if (!db) {
+      throw new Error('Kết nối Firestore (dayhockhoi4) chưa được khởi tạo.');
+    }
+
+    const docRef = doc(db, QUESTIONS_COLLECTION, sanitized.id);
+    try {
+      await setDoc(docRef, cleanPayload, { merge: true });
+    } catch (directErr) {
+      const addedRef = await addDoc(collection(db, QUESTIONS_COLLECTION), cleanPayload);
+      sanitized.id = addedRef.id;
+    }
+
+    // Update local cache after Firestore write succeeds
+    const current = getLocalCachedQuestions();
+    const updated = current.some(q => q.id === sanitized.id)
+      ? current.map(q => (q.id === sanitized.id ? sanitized : q))
+      : [sanitized, ...current];
+    saveLocalCachedQuestions(updated);
+    notifyQuestionSaved(1);
+  } catch (error: any) {
+    console.error('Error saving single question to Firestore:', error);
+    // Keep in local cache as backup
+    const current = getLocalCachedQuestions();
+    const updated = current.some(q => q.id === sanitized.id)
+      ? current.map(q => (q.id === sanitized.id ? sanitized : q))
+      : [sanitized, ...current];
+    saveLocalCachedQuestions(updated);
+
+    throw new Error(error?.message || 'Không thể lưu câu hỏi lên Firestore (dayhockhoi4).');
+  }
+}
+
+/**
+ * Save a batch of questions directly to Firestore collection `questions` (manual or AI Generation)
  */
 export async function saveQuestionsBatchToFirestore(
   questions: QuestionItem[]
@@ -326,59 +381,53 @@ export async function saveQuestionsBatchToFirestore(
     return { success: true, count: 0 };
   }
 
-  const sanitizedList = questions.map(q => sanitizeQuestionForFirestore(q));
+  const sanitizedList = questions
+    .filter((q) => q && !isSampleQuestionId(q.id))
+    .map(q => sanitizeQuestionForFirestore(q));
 
-  if (!db || isFirestoreQuotaExceeded()) {
-    const current = getLocalCachedQuestions();
-    const idMap = new Map(sanitizedList.map(q => [q.id, q]));
-    const updatedExisting = current.map(q => (idMap.has(q.id) ? idMap.get(q.id)! : q));
-    const newItems = sanitizedList.filter(q => !current.some(c => c.id === q.id));
-    const finalCache = [...newItems, ...updatedExisting];
-    saveLocalCachedQuestions(finalCache);
-    notifyQuestionSaved(sanitizedList.length);
-    return { success: true, count: sanitizedList.length };
+  if (!db) {
+    throw new Error('Kết nối Firestore (dayhockhoi4) chưa sẵn sàng.');
   }
 
-  const TIMEOUT_MS = 15000;
-  let timeoutId: any = null;
+  // Clear any stale quota flags so user-initiated question saves are never skipped
+  if (typeof window !== 'undefined') {
+    try {
+      localStorage.removeItem('eduplay_k4_firestore_quota_exceeded');
+      localStorage.removeItem('eduplay_k4_firestore_quota_v2_exceeded');
+    } catch {}
+  }
 
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(() => {
-      reject(new Error("Hết thời gian chờ phản hồi từ CSDL Firestore (15 giây). Vui lòng kiểm tra lại kết nối mạng hoặc quyền truy cập."));
-    }, TIMEOUT_MS);
-  });
-
-  const batchWriteOperation = async (): Promise<{ success: boolean; count: number }> => {
-    // 1. Chunk writeBatch into maximum 500 operations per batch
-    const CHUNK_SIZE = 500;
+  try {
+    // 1. Ghi trực tiếp từng câu hỏi hoặc theo batch lên collection 'questions' của dự án dayhockhoi4
+    const CHUNK_SIZE = 200;
     for (let i = 0; i < sanitizedList.length; i += CHUNK_SIZE) {
       const chunk = sanitizedList.slice(i, i + CHUNK_SIZE);
-      const batch = trackedWriteBatch(db);
-      chunk.forEach(q => {
-        const docRef = doc(db, QUESTIONS_COLLECTION, q.id);
-        batch.set(docRef, q);
-      });
-      await batch.commit();
-    }
-
-    // 2. Verification read from server using getDocFromServer to confirm persistence
-    if (sanitizedList.length > 0) {
-      const firstId = sanitizedList[0].id;
-      const verifyDocRef = doc(db, QUESTIONS_COLLECTION, firstId);
       try {
-        const snap = await getDocFromServer(verifyDocRef);
-        if (!snap.exists()) {
-          throw new Error("Không thể xác nhận dữ liệu đã được lưu thành công trên máy chủ Firestore.");
-        }
-      } catch (verifyErr: any) {
-        console.warn('Xác thực ghi dữ liệu lên máy chủ gặp cảnh báo:', verifyErr);
-        if (verifyErr?.code === 'permission-denied' || verifyErr?.message?.includes('permission')) {
-          throw verifyErr;
+        const batch = writeBatch(db);
+        chunk.forEach(q => {
+          const docRef = doc(db, QUESTIONS_COLLECTION, q.id);
+          batch.set(docRef, sanitizeForFirestore(q), { merge: true });
+        });
+        await batch.commit();
+      } catch (batchErr) {
+        // Fallback: ghi trực tiếp từng document bằng setDoc / addDoc nếu writeBatch gặp lỗi
+        for (const q of chunk) {
+          const cleanQ = sanitizeForFirestore(q);
+          try {
+            const docRef = doc(db, QUESTIONS_COLLECTION, q.id);
+            await setDoc(docRef, cleanQ, { merge: true });
+          } catch {
+            const added = await addDoc(collection(db, QUESTIONS_COLLECTION), cleanQ);
+            q.id = added.id;
+          }
         }
       }
     }
 
-    // 3. Update local cache after server verification
+    // 2. Dọn bỏ 6 câu hỏi mẫu cũ q_k4_01..q_k4_06 nếu còn tồn tại trên Firestore
+    purgeSampleQuestionsFromFirestore().catch(() => {});
+
+    // 3. Cập nhật bộ nhớ đệm cục bộ và phát sự kiện cập nhật giao diện ngay lập tức
     const current = getLocalCachedQuestions();
     const idMap = new Map(sanitizedList.map(q => [q.id, q]));
     const updatedExisting = current.map(q => (idMap.has(q.id) ? idMap.get(q.id)! : q));
@@ -388,27 +437,16 @@ export async function saveQuestionsBatchToFirestore(
 
     notifyQuestionSaved(sanitizedList.length);
     return { success: true, count: sanitizedList.length };
-  };
-
-  try {
-    const result = await Promise.race([batchWriteOperation(), timeoutPromise]);
-    if (timeoutId) clearTimeout(timeoutId);
-    return result;
   } catch (error: any) {
-    if (timeoutId) clearTimeout(timeoutId);
-    console.error('Lỗi khi lưu danh sách câu hỏi vào Firestore:', error);
+    console.error('Lỗi khi lưu danh sách câu hỏi vào Firestore (dayhockhoi4):', error);
+    // Vẫn lưu bản sao vào cache cục bộ để giáo viên không bị mất dữ liệu vừa soạn
+    const current = getLocalCachedQuestions();
+    const idMap = new Map(sanitizedList.map(q => [q.id, q]));
+    const updatedExisting = current.map(q => (idMap.has(q.id) ? idMap.get(q.id)! : q));
+    const newItems = sanitizedList.filter(q => !current.some(c => c.id === q.id));
+    saveLocalCachedQuestions([...newItems, ...updatedExisting]);
 
-    const errMsg = error?.message || String(error || '');
-    if (
-      errMsg.includes('resource-exhausted') ||
-      errMsg.includes('Quota exceeded') ||
-      errMsg.includes('unavailable')
-    ) {
-        localStorage.setItem('eduplay_k4_firestore_quota_exceeded', 'true');
-
-    }
-
-    throw error;
+    throw new Error(error?.message || 'Lỗi ghi dữ liệu câu hỏi lên Firestore (dayhockhoi4).');
   }
 }
 
@@ -482,7 +520,7 @@ export function downloadQuestionsAsCSV(questions: QuestionItem[], filename = 'da
 export async function deleteQuestionFromFirestore(id: string): Promise<void> {
   const path = `${QUESTIONS_COLLECTION}/${id}`;
 
-  if (!db || isFirestoreQuotaExceeded()) {
+  if (!db) {
     const current = getLocalCachedQuestions();
     saveLocalCachedQuestions(current.filter(q => q.id !== id));
     return;
@@ -499,7 +537,6 @@ export async function deleteQuestionFromFirestore(id: string): Promise<void> {
   const deleteOp = async () => {
     const docRef = doc(db, QUESTIONS_COLLECTION, id);
     await trackedDeleteDoc(docRef);
-    await waitForWriteConfirmation(docRef, 12000, true);
     const current = getLocalCachedQuestions();
     saveLocalCachedQuestions(current.filter(q => q.id !== id));
   };
@@ -510,19 +547,6 @@ export async function deleteQuestionFromFirestore(id: string): Promise<void> {
   } catch (error: any) {
     if (timeoutId) clearTimeout(timeoutId);
     console.error('Error deleting question from Firestore:', error);
-    const errMsg = error?.message || String(error || '');
-    if (
-      errMsg.includes('resource-exhausted') ||
-      errMsg.includes('Quota exceeded') ||
-      errMsg.includes('unavailable')
-    ) {
-      try {
-        localStorage.setItem('eduplay_k4_firestore_quota_exceeded', 'true');
-      } catch {}
-      const current = getLocalCachedQuestions();
-      saveLocalCachedQuestions(current.filter(q => q.id !== id));
-      return;
-    }
     handleFirestoreError(error, FirestoreOpType.DELETE, path);
     throw error;
   }
@@ -540,7 +564,7 @@ export async function deleteQuestionsBatchFromFirestore(
   localStorage.setItem('eduplay_k4_questions_db_initialized', 'true');
   const idSet = new Set(ids);
 
-  if (!db || isFirestoreQuotaExceeded()) {
+  if (!db) {
     const current = getLocalCachedQuestions();
     saveLocalCachedQuestions(current.filter(q => !idSet.has(q.id)));
     if (onProgress) onProgress(ids.length, ids.length);
@@ -568,7 +592,6 @@ export async function deleteQuestionsBatchFromFirestore(
         batch.delete(docRef);
       });
       await batch.commit();
-      await waitForWriteConfirmation(null, 12000, true);
       deletedCount += chunk.length;
       if (onProgress) {
         onProgress(deletedCount, ids.length);
@@ -588,22 +611,6 @@ export async function deleteQuestionsBatchFromFirestore(
   } catch (error: any) {
     if (timeoutId) clearTimeout(timeoutId);
     console.error('Lỗi khi thực hiện writeBatch trên Firestore:', error);
-    const errMsg = error?.message || String(error || '');
-
-    if (
-      errMsg.includes('resource-exhausted') ||
-      errMsg.includes('Quota exceeded') ||
-      errMsg.includes('unavailable')
-    ) {
-      try {
-        localStorage.setItem('eduplay_k4_firestore_quota_exceeded', 'true');
-      } catch {}
-      const current = getLocalCachedQuestions();
-      saveLocalCachedQuestions(current.filter(q => !idSet.has(q.id)));
-      if (onProgress) onProgress(ids.length, ids.length);
-      return { success: true, count: ids.length };
-    }
-
     const path = `${QUESTIONS_COLLECTION}/[batch_${ids.length}]`;
     handleFirestoreError(error, FirestoreOpType.DELETE, path);
     throw error;
@@ -617,13 +624,18 @@ export async function fetchQuestionsFromFirestore(scopeOverride?: ScopeOverride)
   try {
     if (!db) return getLocalCachedQuestions();
 
+    // Xóa các câu hỏi mẫu q_k4_01..q_k4_06 trên Firestore (chạy ngầm an toàn)
+    purgeSampleQuestionsFromFirestore().catch(() => {});
+
     const snap = await getScopedDocs('questions', scopeOverride);
     if (snap && !snap.empty) {
       localStorage.setItem('eduplay_k4_questions_db_initialized', 'true');
-      const items: QuestionItem[] = snap.docs.map(docSnap => ({
-        ...(docSnap.data() as QuestionItem),
-        id: docSnap.id
-      }));
+      const items: QuestionItem[] = snap.docs
+        .filter(docSnap => !isSampleQuestionId(docSnap.id))
+        .map(docSnap => ({
+          ...(docSnap.data() as QuestionItem),
+          id: docSnap.id
+        }));
       saveLocalCachedQuestions(items);
       return items;
     } else if (snap) {
@@ -661,10 +673,16 @@ export function subscribeToQuestionsFromFirestore(
 
         if (!snapshot.empty) {
           localStorage.setItem('eduplay_k4_questions_db_initialized', 'true');
-          const loaded: QuestionItem[] = snapshot.docs.map(d => ({
-            ...(d.data() as QuestionItem),
-            id: d.id
-          }));
+          const sampleDocs = snapshot.docs.filter(d => isSampleQuestionId(d.id));
+          if (sampleDocs.length > 0) {
+            purgeSampleQuestionsFromFirestore().catch(() => {});
+          }
+          const loaded: QuestionItem[] = snapshot.docs
+            .filter(d => !isSampleQuestionId(d.id))
+            .map(d => ({
+              ...(d.data() as QuestionItem),
+              id: d.id
+            }));
           saveLocalCachedQuestions(loaded);
           onData(loaded);
         } else {

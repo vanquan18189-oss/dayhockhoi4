@@ -38,7 +38,20 @@ import {
 import { QuestionItem, CognitiveLevel, UserRole } from '../../types';
 import { PRIMARY_SCHOOL_SUBJECTS } from '../../services/mockData';
 import { QUESTION_TYPES, getQuestionTypeLabel, matchesQuestionType, normalizeQuestionType, getCorrectOrderingSequence } from '../../lib/constants';
-import { sanitizeQuestionForFirestore, fetchQuestionsFromFirestore, subscribeToQuestionsFromFirestore, getLocalCachedQuestions, deleteQuestionFromFirestore, deleteQuestionsBatchFromFirestore, saveQuestionsBatchToFirestore, downloadQuestionsAsJSON, downloadQuestionsAsCSV } from '../../services/questionStorageService';
+import {
+  sanitizeQuestionForFirestore,
+  fetchQuestionsFromFirestore,
+  subscribeToQuestionsFromFirestore,
+  getLocalCachedQuestions,
+  deleteQuestionFromFirestore,
+  deleteQuestionsBatchFromFirestore,
+  saveQuestionToFirestore,
+  saveQuestionsBatchToFirestore,
+  downloadQuestionsAsJSON,
+  downloadQuestionsAsCSV,
+  isSampleQuestionId,
+  purgeSampleQuestionsFromFirestore
+} from '../../services/questionStorageService';
 import { downloadQuestionBankTemplate, exportQuestionBankToExcel } from '../../services/excelService';
 import { generateExamQuestionsAI, cleanRawExamText } from '../../services/geminiService';
 import { TECHNOLOGY_GRADE4_FINAL_EXAM_BLUEPRINT } from '../../config/examBlueprints';
@@ -346,11 +359,12 @@ export const QuestionBankModule: React.FC<QuestionBankModuleProps> = ({
     return false;
   }, [isAdmin, activeTeacherProfile.id, activeTeacherProfile.name]);
 
-  // Danh sách câu hỏi đồng bộ trực tiếp từ Firestore 'questions' và cache
+  // Danh sách câu hỏi đồng bộ trực tiếp từ Firestore 'questions' và cache (đã loại bỏ 6 câu mẫu q_k4_01..q_k4_06)
   const [internalQuestions, setInternalQuestions] = useState<QuestionItem[]>(() => {
-    if (questions && questions.length > 50) return questions;
-    const cached = getLocalCachedQuestions();
-    return cached && cached.length > 0 ? cached : (questions || []);
+    const baseList = (questions && questions.length > 50)
+      ? questions
+      : ((getLocalCachedQuestions()?.length || 0) > 0 ? getLocalCachedQuestions() : (questions || []));
+    return baseList.filter(q => !isSampleQuestionId(q.id));
   });
 
   // Tải danh sách câu hỏi theo phạm vi phân quyền từ Firestore collection 'questions'
@@ -361,35 +375,57 @@ export const QuestionBankModule: React.FC<QuestionBankModuleProps> = ({
       teacherEmail: authEmail || undefined
     };
 
+    // Xóa triệt để 6 câu hỏi mẫu q_k4_01..q_k4_06 trên Firestore và cache
+    purgeSampleQuestionsFromFirestore().catch(() => {});
+
     fetchQuestionsFromFirestore(scopeOverride).then((remoteQuestions) => {
-      if (isMounted && remoteQuestions && remoteQuestions.length > 0) {
-        setInternalQuestions(remoteQuestions);
+      if (isMounted && remoteQuestions) {
+        const cleaned = remoteQuestions.filter(q => !isSampleQuestionId(q.id));
+        if (cleaned.length > 0) {
+          setInternalQuestions(cleaned);
+        }
       }
     });
 
     const unsubscribe = subscribeToQuestionsFromFirestore(
       (liveQuestions) => {
-        if (isMounted && liveQuestions && liveQuestions.length > 0) {
-          setInternalQuestions(liveQuestions);
+        if (isMounted && liveQuestions) {
+          const cleaned = liveQuestions.filter(q => !isSampleQuestionId(q.id));
+          setInternalQuestions((prev) => {
+            if (cleaned.length > 0) return cleaned;
+            return prev.filter(q => !isSampleQuestionId(q.id));
+          });
         }
       },
       undefined,
       scopeOverride
     );
 
+    const handleQuestionsUpdated = () => {
+      if (!isMounted) return;
+      const latest = getLocalCachedQuestions().filter(q => !isSampleQuestionId(q.id));
+      if (latest.length > 0) {
+        setInternalQuestions(latest);
+      }
+    };
+    window.addEventListener('eduplay_questions_updated', handleQuestionsUpdated);
+
     return () => {
       isMounted = false;
       unsubscribe();
+      window.removeEventListener('eduplay_questions_updated', handleQuestionsUpdated);
     };
   }, [userRole, authEmail]);
 
   // Cập nhật khi prop questions từ component cha truyền xuống
   useEffect(() => {
     if (questions && questions.length > 0) {
+      const cleanedProps = questions.filter(q => !isSampleQuestionId(q.id));
       setInternalQuestions((prev) => {
-        if (questions.length >= prev.length) return questions;
-        const idSet = new Set(questions.map((q) => q.id));
-        return [...questions, ...prev.filter((p) => !idSet.has(p.id))];
+        const cleanedPrev = prev.filter(q => !isSampleQuestionId(q.id));
+        if (cleanedProps.length >= cleanedPrev.length) return cleanedProps;
+        const idSet = new Set(cleanedProps.map((q) => q.id));
+        return [...cleanedProps, ...cleanedPrev.filter((p) => !idSet.has(p.id))];
       });
     }
   }, [questions]);
@@ -418,29 +454,61 @@ export const QuestionBankModule: React.FC<QuestionBankModuleProps> = ({
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const showToast = (message: string, type: 'success' | 'error' = 'success') => {
     setToast({ message, type });
-    setTimeout(() => setToast(null), 3500);
+    setTimeout(() => setToast(null), 4000);
   };
 
   const handleSaveManualQuestions = async (newQuestions: QuestionItem[]) => {
     try {
-      const sanitized = newQuestions.map(q => sanitizeQuestionForFirestore(q));
+      const sanitized = newQuestions.map(q =>
+        sanitizeQuestionForFirestore({
+          ...q,
+          grade: '4',
+          teacherId: q.teacherId || activeTeacherProfile.id,
+          teacherEmail: q.teacherEmail || activeTeacherProfile.email || authEmail || 'thuthuthtk@gmail.com',
+          teacherName: q.teacherName || activeTeacherProfile.name,
+          createdAt: q.createdAt || Date.now()
+        })
+      );
+
+      // Ghi trực tiếp lên Firestore collection 'questions' của dự án dayhockhoi4
+      await saveQuestionsBatchToFirestore(sanitized);
+
+      // Đồng bộ state lên App.tsx nếu có callback
       if (onSaveQuestions) {
-        await onSaveQuestions(sanitized);
-      } else {
+        try {
+          await onSaveQuestions(sanitized);
+        } catch (parentErr) {
+          console.warn('onSaveQuestions parent callback warning:', parentErr);
+        }
+      } else if (onSaveQuestion) {
         for (const q of sanitized) {
-          await onSaveQuestion(q);
+          try {
+            await onSaveQuestion(q);
+          } catch {}
         }
       }
+
+      // Cập nhật ngay state hiển thị tại chỗ
+      setInternalQuestions((prev) => {
+        const map = new Map<string, QuestionItem>();
+        sanitized.forEach(item => map.set(item.id, item));
+        prev.filter(p => !isSampleQuestionId(p.id)).forEach(item => {
+          if (!map.has(item.id)) map.set(item.id, item);
+        });
+        return Array.from(map.values());
+      });
+
       if (sanitized.length > 0) {
         setSubjectFilter(sanitized[0].subject);
-        setGradeFilter(sanitized[0].grade);
-        setLessonFilter(sanitized[0].lessonName);
+        setGradeFilter('Tất cả các khối');
+        setLessonFilter('all');
       }
       setIsManualModalOpen(false);
-      showToast("Đã lưu thành công dữ liệu câu hỏi!", "success");
-    } catch (error) {
-      console.error('Error saving manual questions:', error);
-      showToast("Lưu câu hỏi thất bại, vui lòng kiểm tra lại!", "error");
+      showToast(`Đã lưu thành công ${sanitized.length} câu hỏi lên Firestore (questions - dayhockhoi4)!`, "success");
+    } catch (error: any) {
+      console.error('Error saving manual questions to Firestore:', error);
+      const errMsg = error?.message || 'Không thể kết nối hoặc ghi lên Firestore (questions).';
+      showToast(`Lưu câu hỏi lên Firestore thất bại: ${errMsg}`, "error");
     }
   };
 
@@ -636,23 +704,31 @@ export const QuestionBankModule: React.FC<QuestionBankModuleProps> = ({
   const handleDuplicateQuestion = async (q: QuestionItem) => {
     const newId = `q-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     const newCode = `${q.code}-COPY`;
-    const duplicated: QuestionItem = {
+    const duplicated: QuestionItem = sanitizeQuestionForFirestore({
       ...q,
       id: newId,
       code: newCode,
       content: `${q.content} (Bản sao)`,
+      grade: '4',
       teacherId: activeTeacherProfile.id,
       teacherName: activeTeacherProfile.name,
-      teacherEmail: activeTeacherProfile.email,
+      teacherEmail: activeTeacherProfile.email || authEmail || 'thuthuthtk@gmail.com',
       createdBy: activeTeacherProfile.id,
       authorName: activeTeacherProfile.name,
-      authorType: 'my'
-    };
+      authorType: 'my',
+      createdAt: Date.now()
+    });
     try {
-      await onSaveQuestion(duplicated);
-      showToast("Đã sao chép câu hỏi thành công!", "success");
-    } catch (err) {
-      showToast("Sao chép câu hỏi thất bại!", "error");
+      await saveQuestionToFirestore(duplicated);
+      if (onSaveQuestion) {
+        try {
+          await onSaveQuestion(duplicated);
+        } catch {}
+      }
+      setInternalQuestions(prev => [duplicated, ...prev.filter(item => !isSampleQuestionId(item.id))]);
+      showToast("Đã sao chép và lưu câu hỏi lên Firestore thành công!", "success");
+    } catch (err: any) {
+      showToast(`Sao chép câu hỏi thất bại: ${err?.message || 'Lỗi kết nối Firestore'}`, "error");
     }
   };
 
@@ -722,37 +798,53 @@ export const QuestionBankModule: React.FC<QuestionBankModuleProps> = ({
           id: q.id || `q-${Date.now()}-${idx}-${Math.random().toString(36).substring(2, 5)}`,
           code: q.code || fallbackCode,
           subject: quickSubject || q.subject || 'Toán',
-          grade: quickGrade || q.grade || 'Khối 4',
+          grade: '4',
           level: q.level || 'nhan_biet',
           type: normalizeQuestionType(q.type),
           lessonName: quickLessonName || q.lessonName || 'Bài học',
           content: q.content,
           explanation: q.explanation || 'Giải thích sư phạm cho câu hỏi.',
+          teacherId: q.teacherId || activeTeacherProfile.id,
+          teacherEmail: q.teacherEmail || activeTeacherProfile.email || authEmail || 'thuthuthtk@gmail.com',
+          teacherName: q.teacherName || activeTeacherProfile.name,
           createdAt: q.createdAt || Date.now()
         };
         return sanitizeQuestionForFirestore(raw);
       });
 
+      // Ghi trực tiếp lên Firestore collection 'questions' của dự án dayhockhoi4
+      await saveQuestionsBatchToFirestore(sanitizedQuestions);
+
       if (onSaveQuestions) {
-        await onSaveQuestions(sanitizedQuestions);
-      } else {
-        await saveQuestionsBatchToFirestore(sanitizedQuestions);
+        try {
+          await onSaveQuestions(sanitizedQuestions);
+        } catch (parentErr) {
+          console.warn('onSaveQuestions parent callback warning:', parentErr);
+        }
       }
-      
+
+      // Cập nhật ngay state hiển thị tại chỗ
+      setInternalQuestions((prev) => {
+        const map = new Map<string, QuestionItem>();
+        sanitizedQuestions.forEach(item => map.set(item.id, item));
+        prev.filter(p => !isSampleQuestionId(p.id)).forEach(item => {
+          if (!map.has(item.id)) map.set(item.id, item);
+        });
+        return Array.from(map.values());
+      });
+
       // Set appropriate filters to display the newly imported exam/questions
       setSubjectFilter(quickSubject);
-      setGradeFilter(quickGrade);
-      if (quickLessonName) {
-        setLessonFilter(quickLessonName);
-      }
-      
+      setGradeFilter('Tất cả các khối');
+      setLessonFilter('all');
+
       handleCloseModal();
-      showToast(`Đã lưu thành công ${sanitizedQuestions.length} câu hỏi vào hệ thống!`, "success");
+      showToast(`Đã lưu thành công ${sanitizedQuestions.length} câu hỏi lên Firestore (questions - dayhockhoi4)!`, "success");
     } catch (error: any) {
       console.error('Error saving questions to database:', error);
       const errorMessage = error?.message || (typeof error === 'string' ? error : 'Firebase từ chối ghi hoặc gián đoạn kết nối CSDL.');
       setSaveError(errorMessage);
-      showToast(`Lỗi khi lưu vào CSDL: ${errorMessage}`, "error");
+      showToast(`Lỗi khi lưu câu hỏi lên Firestore: ${errorMessage}`, "error");
     } finally {
       setIsSaving(false);
     }
@@ -810,7 +902,8 @@ export const QuestionBankModule: React.FC<QuestionBankModuleProps> = ({
     setOrderingOptionsState({ ...orderingOptionsState, [questionId]: opts });
   };
 
-  const activeQuestionsList = internalQuestions && internalQuestions.length > 0 ? internalQuestions : (questions || []);
+  const activeQuestionsList = (internalQuestions && internalQuestions.length > 0 ? internalQuestions : (questions || []))
+    .filter(q => !isSampleQuestionId(q.id));
 
   // Get unique list of lessons for current subject & grade filter
   const availableLessons = Array.from(
