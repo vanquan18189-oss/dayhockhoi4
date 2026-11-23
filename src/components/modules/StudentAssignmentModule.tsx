@@ -280,17 +280,27 @@ export const StudentAssignmentModule: React.FC<StudentAssignmentModuleProps> = (
         const docSnap = await getDoc(studentResultRef);
         if (isCancelled || !docSnap.exists()) return;
 
-        const data = docSnap.data();
-        const assignmentsMap = data.assignments || {};
+        const data = docSnap.data() || {};
+        const assignmentsMap: Record<string, any> = { ...(data.assignments || {}) };
+        // Hỗ trợ cả các bản ghi cũ bị lưu dưới khóa phẳng có dấu chấm "assignments.{id}"
+        Object.entries(data).forEach(([k, v]) => {
+          if (k.startsWith('assignments.') && v && typeof v === 'object') {
+            const subId = k.slice('assignments.'.length);
+            if (subId && !assignmentsMap[subId]) {
+              assignmentsMap[subId] = v;
+            }
+          }
+        });
         const resultItems: AssignmentSubmissionItem[] = [];
 
         Object.entries(assignmentsMap).forEach(([assignmentId, resData]: [string, any]) => {
+          if (!resData || typeof resData !== 'object') return;
           const matchingLive = liveAssignments.find(as => as.id === assignmentId);
           const assignmentObj = matchingLive || (resData.assignment || {
             id: assignmentId,
             title: resData.title || 'Bài tập rèn luyện',
             subject: resData.subject || 'Môn học',
-            questions: resData.questions || []
+            questions: resData.questionSnapshot || resData.questions || []
           });
 
           resultItems.push({
@@ -563,121 +573,35 @@ export const StudentAssignmentModule: React.FC<StudentAssignmentModuleProps> = (
       status: 'submitted' as const
     });
 
-    // Update parent state if available
-    if (onSaveAssignment && newSub.assignment) {
-      const existingSubs = Array.isArray(newSub.assignment.submissions) ? [...newSub.assignment.submissions] : [];
-      const filtered = existingSubs.filter((s: any) => {
-        const sCode = normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || s?.code || '');
-        return sCode !== authenticCode;
-      });
-      filtered.push(submissionRecord as any);
-      const updatedAssignment: HomeworkAssignment = {
-        ...newSub.assignment,
-        submissions: filtered,
-        completedCount: filtered.length
-      };
-      onSaveAssignment(updatedAssignment);
-    }
-
-    // Nếu StudentExamModule đã đồng bộ trực tiếp lên Firestore thì không lặp lại transaction gây xung đột
+    // Quy ước lưu chuẩn duy nhất: chỉ ghi vào `student_results/{Mã HS chuẩn}` dưới `assignments.{assignmentId}`
+    // Ngừng ghi bản sao vào `assignments/{id}.submissions`, `assignments/{id}/submissions`, và ngừng cập nhật `completedCount` / `submittedCount`.
     if (!newSub.alreadySyncedToFirestore && db && assignmentId) {
-      const assignRef = doc(db, 'assignments', assignmentId);
-      const subDocRef = doc(db, 'assignments', assignmentId, 'submissions', authenticCode);
-
       try {
         await withFirestoreTimeout(
-          runTransaction(db, async (transaction) => {
-            const assignSnap = await transaction.get(assignRef);
-            let existingSubs: any[] = [];
-            if (assignSnap.exists()) {
-              const currentData = assignSnap.data();
-              existingSubs = Array.isArray(currentData.submissions) ? [...currentData.submissions] : [];
-            }
-
-            const filtered = existingSubs
-              .filter((s: any) => {
-                const sCode = normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || s?.code || '');
-                return sCode !== authenticCode;
-              })
-              .map((s: any) => sanitizeForFirestore(s));
-
-            filtered.push(submissionRecord);
-
-            const uniqueStudentKeys = new Set(
-              filtered
-                .map((s: any) => normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || ''))
-                .filter(Boolean)
-            );
-            const count = uniqueStudentKeys.size;
-            const submittedIdsList = Array.from(uniqueStudentKeys);
-
-            transaction.set(subDocRef, sanitizeForFirestore({
-              ...submissionRecord,
-              assignmentId,
-              targetId: assignmentId,
-              updatedAt: new Date().toISOString()
-            }), { merge: true });
-
-            transaction.set(assignRef, sanitizeForFirestore({
-              submissions: filtered,
-              submittedIds: submittedIdsList,
-              submittedCount: count,
-              completedCount: count,
-              updatedAt: new Date().toISOString()
-            }), { merge: true });
+          studentResultService.saveAssignmentResult(authenticCode, {
+            assignmentId,
+            targetId: assignmentId,
+            originalAssignmentId: newSub.assignment?.originalAssignmentId || null,
+            title: newSub.title || newSub.assignment?.title || 'Bài tập',
+            subject: newSub.subject || newSub.assignment?.subject || 'Môn học',
+            studentName: effectiveUserName || 'Học sinh',
+            studentClass: studentClass || newSub.assignment?.targetClass || '',
+            score: numScore,
+            totalScore: numScore,
+            maxScore: 10,
+            correctCount,
+            totalQuestions,
+            submittedAt: safeSubmittedTime,
+            submittedTime: safeSubmittedTime,
+            attemptNumber: 1,
+            gradingStatus: 'graded',
+            answers: normalizedAnswers,
+            answersById,
+            keepAttempts: 'last'
           }),
           10000,
-          'StudentAssignmentModule.runTransaction'
+          'StudentAssignmentModule.saveAssignmentResult'
         );
-      } catch (e) {
-        console.warn('⚠️ [Transaction Nộp Bài] Lỗi/Timeout, thử lưu trực tiếp subcollection:', e);
-        try {
-          await withFirestoreTimeout(
-            setDoc(subDocRef, sanitizeForFirestore({
-              ...submissionRecord,
-              assignmentId,
-              targetId: assignmentId,
-              updatedAt: new Date().toISOString()
-            }), { merge: true }),
-            8000,
-            'StudentAssignmentModule.fallbackSetDoc'
-          );
-        } catch (fallbackErr) {
-          console.warn('⚠️ [Fallback setDoc Nộp Bài] Đã lưu dự phòng LocalStorage:', fallbackErr);
-        }
-      }
-
-      try {
-        await Promise.allSettled([
-          withFirestoreTimeout(
-            studentResultService.saveFullAssignmentSubmission(authenticCode, assignmentId, submissionRecord),
-            8000,
-            'StudentAssignmentModule.saveFullAssignmentSubmission'
-          ),
-          withFirestoreTimeout(
-            studentResultService.saveAssignmentResult(authenticCode, {
-              assignmentId,
-              targetId: assignmentId,
-              originalAssignmentId: newSub.assignment?.originalAssignmentId || null,
-              title: newSub.title || newSub.assignment?.title || 'Bài tập',
-              subject: newSub.subject || newSub.assignment?.subject || 'Môn học',
-              studentName: effectiveUserName || 'Học sinh',
-              studentClass: studentClass || newSub.assignment?.targetClass || '',
-              score: numScore,
-              totalScore: numScore,
-              maxScore: 10,
-              correctCount,
-              totalQuestions,
-              submittedAt: safeSubmittedTime,
-              submittedTime: safeSubmittedTime,
-              answers: normalizedAnswers,
-              answersById,
-              keepAttempts: 'last'
-            }),
-            8000,
-            'StudentAssignmentModule.saveAssignmentResult'
-          )
-        ]);
       } catch (resErr) {
         console.warn('⚠️ Lỗi cập nhật student_results (đã lưu dự phòng LocalStorage):', resErr);
       }

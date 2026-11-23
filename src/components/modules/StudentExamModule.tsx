@@ -1696,193 +1696,150 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
 
         try {
           if (db && officialExamId) {
-            const fixedSubDocRef = doc(db, 'exams', officialExamId, 'submissions', fixedDocId);
-            const examRef = doc(db, 'exams', officialExamId);
-
-            const writeTasks: Promise<any>[] = [
-              withFirestoreTimeout(
-                setDoc(fixedSubDocRef, sanitizeForFirestore({
-                  ...fullExamRecord,
-                  id: fixedDocId,
-                  examId: officialExamId,
-                  attemptNumber,
-                  updatedAt: new Date().toISOString()
-                }), { merge: true }),
-                8000,
-                'timeoutSubmit.subDoc'
-              ),
-              withFirestoreTimeout(
-                runTransaction(db, async (transaction) => {
-                  const examSnap = await transaction.get(examRef);
-                  if (!examSnap.exists()) return;
-                  const currentData = examSnap.data();
-                  const existingSubs = Array.isArray(currentData.submissions) ? [...currentData.submissions] : [];
-                  const filtered = existingSubs
-                    .filter((s: any) => {
-                      const sCode = normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || s?.sddcn || '');
-                      const sId = String(s?.id || '').toLowerCase();
-                      return sCode !== authenticStudentCode && sId !== fixedDocId.toLowerCase();
-                    })
-                    .map((s: any) => sanitizeForFirestore(s));
-                  filtered.unshift(slimExamRecord);
-                  const deduplicatedDocSubs = deduplicateExamSubmissions(filtered);
-                  transaction.update(examRef, sanitizeForFirestore({
-                    submissions: deduplicatedDocSubs,
-                    updatedAt: new Date().toISOString()
-                  }));
-                }),
-                8000,
-                'timeoutSubmit.examTx'
-              ),
-              withFirestoreTimeout(
-                studentResultService.saveFullExamSubmission(authenticStudentCode, officialExamId, fullExamRecord),
-                8000,
-                'timeoutSubmit.saveFullExam'
-              ),
-              withFirestoreTimeout(
-                studentResultService.saveExamResult(authenticStudentCode, officialExamId, {
+            if (isAssignment || officialExamId.startsWith('as-')) {
+              // Quy ước lưu chuẩn duy nhất cho bài tập: chỉ ghi vào `student_results/{Mã HS chuẩn}` -> `assignments.{assignmentId}`
+              await withFirestoreTimeout(
+                studentResultService.saveAssignmentResult(authenticStudentCode, {
+                  assignmentId: officialExamId,
+                  targetId: officialExamId,
+                  originalAssignmentId: exam.originalExamId || null,
+                  title: exam.title || 'Bài tập',
+                  subject: exam.subject || 'Môn học',
+                  studentName: effectiveStudentName,
+                  studentClass: effectiveStudentClass,
                   score: scoreNumber,
+                  totalScore: scoreNumber,
                   maxScore: 10,
+                  correctCount: Math.round(correct),
+                  totalQuestions: totalQ,
                   submittedAt: nowTimeStr,
-                  type: 'exam'
+                  submittedTime: nowTimeStr,
+                  attemptNumber,
+                  gradingStatus: 'graded',
+                  answers,
+                  answersById,
+                  questionSnapshot: qSnapshot
                 }),
-                8000,
-                'timeoutSubmit.saveExamResult'
-              )
-            ];
+                10000,
+                'timeoutSubmit.saveAsResult'
+              );
+            } else {
+              const fixedSubDocRef = doc(db, 'exams', officialExamId, 'submissions', fixedDocId);
+              const examRef = doc(db, 'exams', officialExamId);
 
-            if (exam.originalExamId && exam.originalExamId !== officialExamId) {
-              const origSubDocRef = doc(db, 'exams', exam.originalExamId, 'submissions', fixedDocId);
-              const origExamRef = doc(db, 'exams', exam.originalExamId);
-              writeTasks.push(
+              const writeTasks: Promise<any>[] = [
                 withFirestoreTimeout(
-                  setDoc(origSubDocRef, sanitizeForFirestore({
+                  setDoc(fixedSubDocRef, sanitizeForFirestore({
                     ...fullExamRecord,
                     id: fixedDocId,
-                    examId: exam.originalExamId,
+                    examId: officialExamId,
                     attemptNumber,
                     updatedAt: new Date().toISOString()
                   }), { merge: true }),
                   8000,
-                  'timeoutSubmit.origSubDoc'
+                  'timeoutSubmit.subDoc'
                 ),
                 withFirestoreTimeout(
                   runTransaction(db, async (transaction) => {
-                    const origSnap = await transaction.get(origExamRef);
-                    if (!origSnap.exists()) return;
-                    const origData = origSnap.data();
-                    const origExisting = Array.isArray(origData.submissions) ? [...origData.submissions] : [];
-                    const origFiltered = origExisting
+                    const examSnap = await transaction.get(examRef);
+                    if (!examSnap.exists()) return;
+                    const currentData = examSnap.data();
+                    const existingSubs = Array.isArray(currentData.submissions) ? [...currentData.submissions] : [];
+                    const filtered = existingSubs
                       .filter((s: any) => {
                         const sCode = normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || s?.sddcn || '');
                         const sId = String(s?.id || '').toLowerCase();
                         return sCode !== authenticStudentCode && sId !== fixedDocId.toLowerCase();
                       })
                       .map((s: any) => sanitizeForFirestore(s));
-                    origFiltered.unshift(slimExamRecord);
-                    const deduplicatedOrigSubs = deduplicateExamSubmissions(origFiltered);
-                    transaction.update(origExamRef, sanitizeForFirestore({
-                      submissions: deduplicatedOrigSubs,
+                    filtered.unshift(slimExamRecord);
+                    const deduplicatedDocSubs = deduplicateExamSubmissions(filtered);
+                    transaction.update(examRef, sanitizeForFirestore({
+                      submissions: deduplicatedDocSubs,
                       updatedAt: new Date().toISOString()
                     }));
                   }),
                   8000,
-                  'timeoutSubmit.origExamTx'
+                  'timeoutSubmit.examTx'
                 ),
                 withFirestoreTimeout(
-                  studentResultService.saveFullExamSubmission(authenticStudentCode, exam.originalExamId, fullExamRecord),
+                  studentResultService.saveFullExamSubmission(authenticStudentCode, officialExamId, fullExamRecord),
                   8000,
-                  'timeoutSubmit.origFull'
+                  'timeoutSubmit.saveFullExam'
                 ),
                 withFirestoreTimeout(
-                  studentResultService.saveExamResult(authenticStudentCode, exam.originalExamId, {
+                  studentResultService.saveExamResult(authenticStudentCode, officialExamId, {
                     score: scoreNumber,
                     maxScore: 10,
                     submittedAt: nowTimeStr,
                     type: 'exam'
                   }),
                   8000,
-                  'timeoutSubmit.origRes'
+                  'timeoutSubmit.saveExamResult'
                 )
-              );
-            }
+              ];
 
-            if (isAssignment || officialExamId.startsWith('as-')) {
-              const asSubDocRef = doc(db, 'assignments', officialExamId, 'submissions', authenticStudentCode);
-              const asRef = doc(db, 'assignments', officialExamId);
-              writeTasks.push(
-                withFirestoreTimeout(
-                  setDoc(asSubDocRef, sanitizeForFirestore({
-                    ...fullExamRecord,
-                    id: authenticStudentCode,
-                    assignmentId: officialExamId,
-                    targetId: officialExamId,
-                    attemptNumber,
-                    updatedAt: new Date().toISOString()
-                  }), { merge: true }),
-                  8000,
-                  'timeoutSubmit.asSubDoc'
-                ),
-                withFirestoreTimeout(
-                  runTransaction(db, async (transaction) => {
-                    const asSnap = await transaction.get(asRef);
-                    if (!asSnap.exists()) return;
-                    const asData = asSnap.data();
-                    const asSubs = Array.isArray(asData.submissions) ? [...asData.submissions] : [];
-                    const asFiltered = asSubs
-                      .filter((s: any) => {
-                        const sCode = normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || s?.sddcn || '');
-                        const sId = String(s?.id || '').toLowerCase();
-                        return sCode !== authenticStudentCode && sId !== fixedDocId.toLowerCase();
-                      })
-                      .map((s: any) => sanitizeForFirestore(s));
-                    asFiltered.unshift(slimExamRecord);
-                    const deduplicatedAsSubs = deduplicateExamSubmissions(asFiltered);
-                    transaction.update(asRef, sanitizeForFirestore({
-                      submissions: deduplicatedAsSubs,
-                      completedCount: deduplicatedAsSubs.length,
-                      submittedCount: deduplicatedAsSubs.length,
+              if (exam.originalExamId && exam.originalExamId !== officialExamId) {
+                const origSubDocRef = doc(db, 'exams', exam.originalExamId, 'submissions', fixedDocId);
+                const origExamRef = doc(db, 'exams', exam.originalExamId);
+                writeTasks.push(
+                  withFirestoreTimeout(
+                    setDoc(origSubDocRef, sanitizeForFirestore({
+                      ...fullExamRecord,
+                      id: fixedDocId,
+                      examId: exam.originalExamId,
+                      attemptNumber,
                       updatedAt: new Date().toISOString()
-                    }));
-                  }),
-                  8000,
-                  'timeoutSubmit.asTx'
-                ),
-                withFirestoreTimeout(
-                  studentResultService.saveFullAssignmentSubmission(authenticStudentCode, officialExamId, fullExamRecord),
-                  8000,
-                  'timeoutSubmit.saveFullAs'
-                ),
-                withFirestoreTimeout(
-                  studentResultService.saveAssignmentResult(authenticStudentCode, {
-                    assignmentId: officialExamId,
-                    targetId: officialExamId,
-                    originalAssignmentId: exam.originalExamId || null,
-                    title: exam.title || 'Bài tập',
-                    subject: exam.subject || 'Môn học',
-                    studentName: effectiveStudentName,
-                    studentClass: effectiveStudentClass,
-                    score: scoreNumber,
-                    totalScore: scoreNumber,
-                    maxScore: 10,
-                    correctCount: Math.round(correct),
-                    totalQuestions: totalQ,
-                    submittedAt: nowTimeStr,
-                    submittedTime: nowTimeStr,
-                    answers,
-                    answersById,
-                    questionSnapshot: qSnapshot
-                  }),
-                  8000,
-                  'timeoutSubmit.saveAsResult'
-                )
-              );
-            }
+                    }), { merge: true }),
+                    8000,
+                    'timeoutSubmit.origSubDoc'
+                  ),
+                  withFirestoreTimeout(
+                    runTransaction(db, async (transaction) => {
+                      const origSnap = await transaction.get(origExamRef);
+                      if (!origSnap.exists()) return;
+                      const origData = origSnap.data();
+                      const origExisting = Array.isArray(origData.submissions) ? [...origData.submissions] : [];
+                      const origFiltered = origExisting
+                        .filter((s: any) => {
+                          const sCode = normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || s?.sddcn || '');
+                          const sId = String(s?.id || '').toLowerCase();
+                          return sCode !== authenticStudentCode && sId !== fixedDocId.toLowerCase();
+                        })
+                        .map((s: any) => sanitizeForFirestore(s));
+                      origFiltered.unshift(slimExamRecord);
+                      const deduplicatedOrigSubs = deduplicateExamSubmissions(origFiltered);
+                      transaction.update(origExamRef, sanitizeForFirestore({
+                        submissions: deduplicatedOrigSubs,
+                        updatedAt: new Date().toISOString()
+                      }));
+                    }),
+                    8000,
+                    'timeoutSubmit.origExamTx'
+                  ),
+                  withFirestoreTimeout(
+                    studentResultService.saveFullExamSubmission(authenticStudentCode, exam.originalExamId, fullExamRecord),
+                    8000,
+                    'timeoutSubmit.origFull'
+                  ),
+                  withFirestoreTimeout(
+                    studentResultService.saveExamResult(authenticStudentCode, exam.originalExamId, {
+                      score: scoreNumber,
+                      maxScore: 10,
+                      submittedAt: nowTimeStr,
+                      type: 'exam'
+                    }),
+                    8000,
+                    'timeoutSubmit.origRes'
+                  )
+                );
+              }
 
-            await Promise.allSettled(writeTasks);
+              await Promise.allSettled(writeTasks);
+            }
           }
         } catch (err) {
-          console.error('Error saving exam submission to Firestore on timeout:', err);
+          console.error('Error saving submission to Firestore on timeout:', err);
         }
 
         // Thưởng đề kiểm tra / bài tập
@@ -2616,117 +2573,64 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
 
         // 2. Đồng bộ lên Firestore có timeout an toàn
         if (db && officialExamId) {
-          const targetCol = (isAssignment || officialExamId.startsWith('as-')) ? 'assignments' : 'exams';
-          const candDocIds = Array.from(new Set([
-            fixedDocId,
-            authenticStudentCode,
-            `${authenticStudentCode}_${officialExamId}_1`
-          ]));
-
-          let foundExistingDoc: any = null;
-          try {
-            const existingChecks = await Promise.allSettled(
-              candDocIds.map(async (candId) => {
-                const candDocRef = doc(db, targetCol, officialExamId, 'submissions', candId);
-                const snap = await withFirestoreTimeout(getDoc(candDocRef), 4000, `checkExisting.${candId}`);
-                return snap.exists() ? snap.data() : null;
-              })
-            );
-            for (const res of existingChecks) {
-              if (res.status === 'fulfilled' && res.value) {
-                foundExistingDoc = res.value;
-                break;
-              }
-            }
-          } catch (checkErr) {
-            console.warn('Tạm bỏ qua bước kiểm tra bài cũ do mạng chậm:', checkErr);
-          }
-
-          if (foundExistingDoc) {
-            console.warn('⚠️ [executeSubmitExam] Học sinh đã có bản ghi bài nộp:', foundExistingDoc.id || fixedDocId);
-            hasSubmittedRef.current = true;
-            setActiveExamSession(null);
-            setToast({
-              message: 'Em đã nộp bài này rồi!',
-              type: 'warning'
-            });
-            setDetailSubmission({
-              exam,
-              score: foundExistingDoc.score !== undefined ? String(foundExistingDoc.score) : scoreVal,
-              time: formatSubmissionDateTime(foundExistingDoc.submittedAt || foundExistingDoc.submittedTime || nowTimeStr),
-              answers: foundExistingDoc.answers || answers,
-              title: exam.title,
-              subject: exam.subject || 'Môn học',
-              rank: foundExistingDoc.rank || rankTier
-            });
-            return;
-          }
-
-          const subDocKey = isAssignment ? authenticStudentCode : fixedDocId;
-          const mainSubDocRef = doc(db, targetCol, officialExamId, 'submissions', subDocKey);
-          const masterDocRef = doc(db, targetCol, officialExamId);
-
-          const primarySubPayload = sanitizeForFirestore({
-            ...fullExamRecord,
-            id: subDocKey,
-            examId: officialExamId,
-            assignmentId: isAssignment ? officialExamId : null,
-            studentCode: authenticStudentCode,
-            studentId: authenticStudentCode,
-            maHs: authenticStudentCode,
-            attemptNumber,
-            updatedAt: new Date().toISOString()
-          });
-
-          let primarySynced = false;
-          try {
+          if (isAssignment || officialExamId.startsWith('as-')) {
+            // QUY ƯỚC LƯU DUY NHẤT CHO BÀI TẬP:
+            // Chỉ ghi vào `student_results/{Mã HS chuẩn}` dưới trường `assignments.{assignmentId}`.
+            // Ngừng ghi bản sao vào `assignments/{id}/submissions`, `assignments/{id}.submissions`, `exams/{id}/submissions` và ngừng cập nhật `completedCount`/`submittedCount`.
             await withFirestoreTimeout(
-              runTransaction(db, async (transaction) => {
-                const subSnap = await transaction.get(mainSubDocRef);
-                if (subSnap.exists()) {
-                  throw new Error('ALREADY_SUBMITTED');
-                }
-                const masterSnap = await transaction.get(masterDocRef);
-                if (masterSnap.exists()) {
-                  const currentData = masterSnap.data();
-                  const existingSubs = Array.isArray(currentData.submissions) ? [...currentData.submissions] : [];
-                  const alreadyInDoc = existingSubs.some((s: any) => {
-                    const sCode = normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || s?.sddcn || '');
-                    return sCode === authenticStudentCode;
-                  });
-                  if (alreadyInDoc) {
-                    throw new Error('ALREADY_SUBMITTED');
-                  }
-                  const filtered = existingSubs
-                    .filter((s: any) => {
-                      const sCode = normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || s?.sddcn || '');
-                      const sId = String(s?.id || '').toLowerCase();
-                      return sCode !== authenticStudentCode && sId !== fixedDocId.toLowerCase();
-                    })
-                    .map((s: any) => sanitizeForFirestore(s));
-                  filtered.unshift(slimExamRecord);
-                  const deduplicatedDocSubs = deduplicateExamSubmissions(filtered);
-                  const uniqueCodes = Array.from(new Set(
-                    deduplicatedDocSubs
-                      .map((s: any) => normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || ''))
-                      .filter(Boolean)
-                  ));
-                  transaction.update(masterDocRef, sanitizeForFirestore({
-                    submissions: deduplicatedDocSubs,
-                    submittedIds: uniqueCodes,
-                    completedCount: deduplicatedDocSubs.length,
-                    submittedCount: deduplicatedDocSubs.length,
-                    updatedAt: new Date().toISOString()
-                  }));
-                }
-                transaction.set(mainSubDocRef, primarySubPayload, { merge: true });
+              studentResultService.saveAssignmentResult(authenticStudentCode, {
+                assignmentId: officialExamId,
+                targetId: officialExamId,
+                originalAssignmentId: exam.originalExamId || null,
+                title: exam.title || 'Bài tập',
+                subject: exam.subject || 'Môn học',
+                studentName: effectiveStudentName,
+                studentClass: effectiveStudentClass,
+                score: scoreNumber,
+                totalScore: scoreNumber,
+                maxScore: 10,
+                correctCount: Math.round(correct),
+                totalQuestions: totalQ,
+                submittedAt: nowTimeStr,
+                submittedTime: nowTimeStr,
+                attemptNumber,
+                gradingStatus: 'graded',
+                answers,
+                answersById,
+                questionSnapshot: qSnapshot
               }),
-              9000,
-              'executeSubmitExam.runTransaction'
+              10000,
+              'executeSubmitExam.saveAssignmentResult'
             );
-            primarySynced = true;
-          } catch (txErr: any) {
-            if (txErr?.message === 'ALREADY_SUBMITTED') {
+          } else {
+            const targetCol = 'exams';
+            const candDocIds = Array.from(new Set([
+              fixedDocId,
+              authenticStudentCode,
+              `${authenticStudentCode}_${officialExamId}_1`
+            ]));
+
+            let foundExistingDoc: any = null;
+            try {
+              const existingChecks = await Promise.allSettled(
+                candDocIds.map(async (candId) => {
+                  const candDocRef = doc(db, targetCol, officialExamId, 'submissions', candId);
+                  const snap = await withFirestoreTimeout(getDoc(candDocRef), 4000, `checkExisting.${candId}`);
+                  return snap.exists() ? snap.data() : null;
+                })
+              );
+              for (const res of existingChecks) {
+                if (res.status === 'fulfilled' && res.value) {
+                  foundExistingDoc = res.value;
+                  break;
+                }
+              }
+            } catch (checkErr) {
+              console.warn('Tạm bỏ qua bước kiểm tra bài cũ do mạng chậm:', checkErr);
+            }
+
+            if (foundExistingDoc) {
+              console.warn('⚠️ [executeSubmitExam] Học sinh đã có bản ghi bài nộp:', foundExistingDoc.id || fixedDocId);
               hasSubmittedRef.current = true;
               setActiveExamSession(null);
               setToast({
@@ -2735,178 +2639,149 @@ export const StudentExamModule: React.FC<StudentExamModuleProps> = ({
               });
               setDetailSubmission({
                 exam,
-                score: scoreVal,
-                time: nowTimeStr,
-                answers,
+                score: foundExistingDoc.score !== undefined ? String(foundExistingDoc.score) : scoreVal,
+                time: formatSubmissionDateTime(foundExistingDoc.submittedAt || foundExistingDoc.submittedTime || nowTimeStr),
+                answers: foundExistingDoc.answers || answers,
                 title: exam.title,
                 subject: exam.subject || 'Môn học',
-                rank: rankTier
+                rank: foundExistingDoc.rank || rankTier
               });
               return;
             }
-            console.warn('runTransaction failed/timeout, fallback to setDoc:', txErr);
-            await withFirestoreTimeout(
-              setDoc(mainSubDocRef, primarySubPayload, { merge: true }),
-              9000,
-              'executeSubmitExam.fallbackSetDoc'
-            );
-            primarySynced = true;
-          }
 
-          if (!primarySynced) {
-            throw new Error('FIRESTORE_WRITE_NOT_CONFIRMED');
-          }
+            const subDocKey = fixedDocId;
+            const mainSubDocRef = doc(db, targetCol, officialExamId, 'submissions', subDocKey);
+            const masterDocRef = doc(db, targetCol, officialExamId);
 
-          // Các tác vụ đồng bộ phụ chạy song song có timeout để không làm treo nút nộp bài
-          const secondarySyncTasks: Promise<any>[] = [
-            withFirestoreTimeout(
-              studentResultService.saveFullExamSubmission(authenticStudentCode, officialExamId, fullExamRecord),
-              8000,
-              'sync.saveFullExamSubmission'
-            ),
-            withFirestoreTimeout(
-              studentResultService.saveExamResult(authenticStudentCode, officialExamId, {
-                score: scoreNumber,
-                maxScore: 10,
-                submittedAt: nowTimeStr,
-                type: isAssignment ? 'assignment' : 'exam'
-              }),
-              8000,
-              'sync.saveExamResult'
-            )
-          ];
+            const primarySubPayload = sanitizeForFirestore({
+              ...fullExamRecord,
+              id: subDocKey,
+              examId: officialExamId,
+              assignmentId: null,
+              studentCode: authenticStudentCode,
+              studentId: authenticStudentCode,
+              maHs: authenticStudentCode,
+              attemptNumber,
+              updatedAt: new Date().toISOString()
+            });
 
-          if (isAssignment || officialExamId.startsWith('as-')) {
-            const exSubDocRef = doc(db, 'exams', officialExamId, 'submissions', fixedDocId);
-            secondarySyncTasks.push(
+            let primarySynced = false;
+            try {
+              await withFirestoreTimeout(
+                runTransaction(db, async (transaction) => {
+                  const subSnap = await transaction.get(mainSubDocRef);
+                  if (subSnap.exists()) {
+                    throw new Error('ALREADY_SUBMITTED');
+                  }
+                  const masterSnap = await transaction.get(masterDocRef);
+                  if (masterSnap.exists()) {
+                    const currentData = masterSnap.data();
+                    const existingSubs = Array.isArray(currentData.submissions) ? [...currentData.submissions] : [];
+                    const alreadyInDoc = existingSubs.some((s: any) => {
+                      const sCode = normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || s?.sddcn || '');
+                      return sCode === authenticStudentCode;
+                    });
+                    if (alreadyInDoc) {
+                      throw new Error('ALREADY_SUBMITTED');
+                    }
+                    const filtered = existingSubs
+                      .filter((s: any) => {
+                        const sCode = normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || s?.sddcn || '');
+                        const sId = String(s?.id || '').toLowerCase();
+                        return sCode !== authenticStudentCode && sId !== fixedDocId.toLowerCase();
+                      })
+                      .map((s: any) => sanitizeForFirestore(s));
+                    filtered.unshift(slimExamRecord);
+                    const deduplicatedDocSubs = deduplicateExamSubmissions(filtered);
+                    const uniqueCodes = Array.from(new Set(
+                      deduplicatedDocSubs
+                        .map((s: any) => normalizeStudentCode(s?.studentCode || s?.maHs || s?.studentId || ''))
+                        .filter(Boolean)
+                    ));
+                    transaction.update(masterDocRef, sanitizeForFirestore({
+                      submissions: deduplicatedDocSubs,
+                      submittedIds: uniqueCodes,
+                      updatedAt: new Date().toISOString()
+                    }));
+                  }
+                  transaction.set(mainSubDocRef, primarySubPayload, { merge: true });
+                }),
+                9000,
+                'executeSubmitExam.runTransaction'
+              );
+              primarySynced = true;
+            } catch (txErr: any) {
+              if (txErr?.message === 'ALREADY_SUBMITTED') {
+                hasSubmittedRef.current = true;
+                setActiveExamSession(null);
+                setToast({
+                  message: 'Em đã nộp bài này rồi!',
+                  type: 'warning'
+                });
+                setDetailSubmission({
+                  exam,
+                  score: scoreVal,
+                  time: nowTimeStr,
+                  answers,
+                  title: exam.title,
+                  subject: exam.subject || 'Môn học',
+                  rank: rankTier
+                });
+                return;
+              }
+              console.warn('runTransaction failed/timeout, fallback to setDoc:', txErr);
+              await withFirestoreTimeout(
+                setDoc(mainSubDocRef, primarySubPayload, { merge: true }),
+                9000,
+                'executeSubmitExam.fallbackSetDoc'
+              );
+              primarySynced = true;
+            }
+
+            if (!primarySynced) {
+              throw new Error('FIRESTORE_WRITE_NOT_CONFIRMED');
+            }
+
+            const secondarySyncTasks: Promise<any>[] = [
               withFirestoreTimeout(
-                setDoc(exSubDocRef, sanitizeForFirestore({
-                  ...fullExamRecord,
-                  id: fixedDocId,
-                  examId: officialExamId,
-                  attemptNumber,
-                  updatedAt: new Date().toISOString()
-                }), { merge: true }),
+                studentResultService.saveFullExamSubmission(authenticStudentCode, officialExamId, fullExamRecord),
                 8000,
-                'sync.parallelExamSub'
-              )
-            );
-          } else {
-            const asSubDocRef = doc(db, 'assignments', officialExamId, 'submissions', authenticStudentCode);
-            secondarySyncTasks.push(
-              withFirestoreTimeout(
-                setDoc(asSubDocRef, sanitizeForFirestore({
-                  ...fullExamRecord,
-                  id: authenticStudentCode,
-                  assignmentId: officialExamId,
-                  attemptNumber,
-                  updatedAt: new Date().toISOString()
-                }), { merge: true }),
-                8000,
-                'sync.parallelAssignSub'
-              )
-            );
-          }
-
-          if (exam.originalExamId && exam.originalExamId !== officialExamId) {
-            secondarySyncTasks.push(
-              withFirestoreTimeout(
-                studentResultService.saveFullExamSubmission(authenticStudentCode, exam.originalExamId, fullExamRecord),
-                8000,
-                'sync.origFullExam'
+                'sync.saveFullExamSubmission'
               ),
               withFirestoreTimeout(
-                studentResultService.saveExamResult(authenticStudentCode, exam.originalExamId, {
+                studentResultService.saveExamResult(authenticStudentCode, officialExamId, {
                   score: scoreNumber,
                   maxScore: 10,
                   submittedAt: nowTimeStr,
                   type: 'exam'
                 }),
                 8000,
-                'sync.origExamResult'
+                'sync.saveExamResult'
               )
-            );
-          }
+            ];
 
-          if (isAssignment) {
-            secondarySyncTasks.push(
-              withFirestoreTimeout(
-                studentResultService.saveFullAssignmentSubmission(authenticStudentCode, officialExamId, fullExamRecord),
-                8000,
-                'sync.saveFullAssignment'
-              ),
-              withFirestoreTimeout(
-                studentResultService.saveAssignmentResult(authenticStudentCode, {
-                  assignmentId: officialExamId,
-                  targetId: officialExamId,
-                  originalAssignmentId: exam.originalExamId || null,
-                  title: exam.title || 'Bài tập',
-                  subject: exam.subject || 'Môn học',
-                  studentName: effectiveStudentName,
-                  studentClass: effectiveStudentClass,
-                  score: scoreNumber,
-                  totalScore: scoreNumber,
-                  maxScore: 10,
-                  correctCount: Math.round(correct),
-                  totalQuestions: totalQ,
-                  submittedAt: nowTimeStr,
-                  submittedTime: nowTimeStr,
-                  answers,
-                  answersById,
-                  questionSnapshot: qSnapshot
-                }),
-                8000,
-                'sync.saveAssignmentResult'
-              )
-            );
             if (exam.originalExamId && exam.originalExamId !== officialExamId) {
-              const origAsSubRef = doc(db, 'assignments', exam.originalExamId, 'submissions', authenticStudentCode);
               secondarySyncTasks.push(
                 withFirestoreTimeout(
-                  setDoc(origAsSubRef, sanitizeForFirestore({
-                    ...fullExamRecord,
-                    id: authenticStudentCode,
-                    assignmentId: exam.originalExamId,
-                    targetId: exam.originalExamId,
-                    attemptNumber,
-                    updatedAt: new Date().toISOString()
-                  }), { merge: true }),
+                  studentResultService.saveFullExamSubmission(authenticStudentCode, exam.originalExamId, fullExamRecord),
                   8000,
-                  'sync.origAsSubDoc'
+                  'sync.origFullExam'
                 ),
                 withFirestoreTimeout(
-                  studentResultService.saveFullAssignmentSubmission(authenticStudentCode, exam.originalExamId, fullExamRecord),
-                  8000,
-                  'sync.origFullAssignment'
-                ),
-                withFirestoreTimeout(
-                  studentResultService.saveAssignmentResult(authenticStudentCode, {
-                    assignmentId: exam.originalExamId,
-                    targetId: exam.originalExamId,
-                    originalAssignmentId: exam.originalExamId,
-                    title: exam.title || 'Bài tập',
-                    subject: exam.subject || 'Môn học',
-                    studentName: effectiveStudentName,
-                    studentClass: effectiveStudentClass,
+                  studentResultService.saveExamResult(authenticStudentCode, exam.originalExamId, {
                     score: scoreNumber,
-                    totalScore: scoreNumber,
                     maxScore: 10,
-                    correctCount: Math.round(correct),
-                    totalQuestions: totalQ,
                     submittedAt: nowTimeStr,
-                    submittedTime: nowTimeStr,
-                    answers,
-                    answersById,
-                    questionSnapshot: qSnapshot
+                    type: 'exam'
                   }),
                   8000,
-                  'sync.origAssignmentResult'
+                  'sync.origExamResult'
                 )
               );
             }
-          }
 
-          await Promise.allSettled(secondarySyncTasks);
+            await Promise.allSettled(secondarySyncTasks);
+          }
         }
 
         // Thưởng bài tập / đề kiểm tra

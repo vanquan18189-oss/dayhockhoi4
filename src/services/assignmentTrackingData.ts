@@ -3,7 +3,7 @@ import { db } from '../firebase';
 import { HomeworkAssignment, StudentRecord } from '../types';
 import { getStudentsFromLocalStorage, generateDefaultClassRoster, fetchClassStudentsFromFirestore } from './studentStorageService';
 import { formatSubmissionDateTime, getCurrentSubmissionTimestamp } from '../utils/scoreUtils';
-import { studentResultService, extractCleanStudentCode } from './studentResultService';
+import { studentResultService, extractCleanStudentCode, getAssignmentResults } from './studentResultService';
 
 export const STANDARD_STUDENT_CODE_REGEX = /^[1-5][A-Z]\d{2}-\d{2}-[1-9]\d{0,2}$/;
 
@@ -562,35 +562,18 @@ export function computeAssignmentTrackingData({
     };
   });
 
-  // 5. Append any submitted studentCode that was NOT in the local class roster
-  // (e.g., when class roster has 0 students or hasn't synced yet, or studentCode is new)
+  // 5. Đếm bài nộp chưa khớp danh sách lớp (KHÔNG gộp vào danh sách lớp chính, KHÔNG cộng vào submittedCount hay totalStudents)
   let unmatchedSubmissionsCount = 0;
-  codeSubMap.forEach((submission, normCode) => {
+  codeSubMap.forEach((_submission, normCode) => {
     if (processedCodes.has(normCode)) return;
     processedCodes.add(normCode);
     unmatchedSubmissionsCount++;
-    submittedCount++;
-
-    const stt = trackingList.length + 1;
-    const rosterMatch = rosterByCode.get(normCode);
-    const displayName =
-      rosterMatch?.name ||
-      rosterMatch?.fullName ||
-      submission.studentName ||
-      submission.name ||
-      submission.fullName ||
-      `Học sinh (${normCode})`;
-    const hasInvalidCodeFormat = !STANDARD_STUDENT_CODE_REGEX.test(normCode);
-
-    trackingList.push(
-      buildSubmittedRow(normCode, displayName, stt, submission, hasInvalidCodeFormat, false)
-    );
   });
 
   return {
     assignmentId: assignment.id,
     targetClass: targetClassName,
-    totalStudents: trackingList.length,
+    totalStudents: roster.length,
     submittedCount,
     unmatchedSubmissionsCount,
     trackingList,
@@ -600,6 +583,7 @@ export function computeAssignmentTrackingData({
 
 /**
  * Fetch tracking data for an assignment (used by Bảng Vàng & Theo dõi nộp bài)
+ * Sử dụng hàm đọc chuẩn duy nhất `getAssignmentResults(assignmentId, classCode)`
  */
 export async function getOrFetchAssignmentTrackingData(
   assignment: HomeworkAssignment,
@@ -622,42 +606,23 @@ export async function getOrFetchAssignmentTrackingData(
     }
   }
 
-  let freshAssignment = assignment;
-  let fetchedSubmissions: any[] = [];
-  let classRoster: StudentRecord[] = getStudentsFromLocalStorage(assignment.targetClass || 'Lớp 4C') || [];
-
-  if (db && assignment.id) {
-    try {
-      const assignRef = doc(db, 'assignments', assignment.id);
-      const assignSnap = await getDoc(assignRef);
-      if (assignSnap.exists()) {
-        freshAssignment = { id: assignSnap.id, ...assignSnap.data() } as HomeworkAssignment;
-      }
-    } catch (err) {
-      console.warn('[TrackingData] Lỗi đọc assignment doc:', err);
+  const unifiedResults = await getAssignmentResults(
+    assignment.id,
+    assignment.targetClass || 'Lớp 4C',
+    {
+      assignment,
+      forceRefresh
     }
-
-    try {
-      fetchedSubmissions = await studentResultService.fetchAssignmentSubmissionsByStudentCode(freshAssignment);
-    } catch (err) {
-      console.warn('[TrackingData] Lỗi đọc bài nộp từ Firestore:', err);
-    }
-
-    if (!classRoster || classRoster.length === 0) {
-      try {
-        const fsRoster = await fetchClassStudentsFromFirestore(freshAssignment.targetClass || 'Lớp 4C');
-        if (fsRoster && fsRoster.length > 0) {
-          classRoster = fsRoster;
-        }
-      } catch {}
-    }
-  }
+  );
 
   const computed = computeAssignmentTrackingData({
-    assignment: freshAssignment,
-    submissionsList: fetchedSubmissions,
-    classRoster
+    assignment,
+    submissionsList: unifiedResults.matched,
+    classRoster: unifiedResults.roster
   });
+  computed.submittedCount = unifiedResults.submittedCount;
+  computed.unmatchedSubmissionsCount = unifiedResults.unmatchedCount;
+  computed.totalStudents = unifiedResults.totalStudents;
 
   setMemoryTrackingData(assignment.id, computed);
   await setIndexedDBTrackingData(assignment.id, computed);

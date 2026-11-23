@@ -18,10 +18,29 @@ export interface ParsedStudentCode {
 export function normalizeStudentCode(code?: string): string {
   if (!code || typeof code !== 'string') return '';
   return code
-    .replace(/[–—−]/g, '-')
+    .replace(/[–—−_]/g, '-')
     .replace(/\s+/g, '')
     .trim()
     .toUpperCase();
+}
+
+/**
+ * Lấy tiền tố Mã HS chuẩn theo mã lớp và năm học (ví dụ: "Lớp 3D" -> "3D26-27-", "4C" -> "4C26-27-")
+ */
+export function getClassCodePrefix(classCode?: string, academicYear: string = '2026-2027'): string {
+  const cleanClass = (classCode || '4C').replace(/^Lớp\s*/i, '').replace(/\s+/g, '').trim().toUpperCase() || '4C';
+  let yearCode = '26-27';
+  if (academicYear.includes('26-27') || academicYear.includes('2026')) {
+    yearCode = '26-27';
+  } else if (academicYear.includes('-')) {
+    const parts = academicYear.split('-');
+    if (parts.length === 2) {
+      const y1 = parts[0].trim().slice(-2);
+      const y2 = parts[1].trim().slice(-2);
+      if (y1 && y2) yearCode = `${y1}-${y2}`;
+    }
+  }
+  return `${cleanClass}${yearCode}-`;
 }
 
 /**
@@ -52,36 +71,22 @@ export function isValidStudentCode(code?: string): boolean {
 
 /**
  * Tạo mã học sinh mới dựa trên lớp, năm học và số thứ tự lớn nhất hiện có + 1.
- * Đảm bảo không dùng lại số cũ.
+ * Đảm bảo không dùng lại số cũ (Mã HS bất biến).
  */
 export function generateStudentCode(className: string, academicYear: string = '2026-2027', existingStts: number[] = []): { code: string; stt: number } {
-  // 1. Chuẩn hóa tên lớp (ví dụ "Lớp 5D" -> "5D", "5d" -> "5D")
-  const cleanClass = className.replace(/^Lớp\s*/i, '').trim().toUpperCase();
+  const prefix = getClassCodePrefix(className, academicYear);
 
-  // 2. Chuẩn hóa năm học (ví dụ "2026-2027" -> "26-27")
-  let yearCode = '26-27';
-  if (academicYear.includes('2026')) {
-    yearCode = '26-27';
-  } else if (academicYear.includes('-')) {
-    const parts = academicYear.split('-');
-    if (parts.length === 2) {
-      const y1 = parts[0].trim().slice(-2);
-      const y2 = parts[1].trim().slice(-2);
-      yearCode = `${y1}-${y2}`;
-    }
-  }
-
-  // 3. Tính số thứ tự tiếp theo (lớn nhất + 1, tránh trùng lặp)
+  // Tính số thứ tự tiếp theo (lớn nhất + 1, tránh trùng lặp, không bao giờ cấp lại số cũ)
   let nextStt = 1;
   if (Array.isArray(existingStts) && existingStts.length > 0) {
-    const validNums = existingStts.filter(n => typeof n === 'number' && !isNaN(n));
+    const validNums = existingStts.filter(n => typeof n === 'number' && !isNaN(n) && n > 0 && n < 10000);
     if (validNums.length > 0) {
       const maxStt = Math.max(...validNums);
       nextStt = maxStt >= 1 ? maxStt + 1 : 1;
     }
   }
 
-  const code = `${cleanClass}${yearCode}-${nextStt}`;
+  const code = `${prefix}${nextStt}`;
   return { code, stt: nextStt };
 }
 
@@ -108,11 +113,11 @@ export function parseStudentCode(code?: string): ParsedStudentCode | null {
  * Chuẩn hóa mọi biến thể của Mã học sinh về dạng chuẩn duy nhất Lớp-NămHọc-STT (ví dụ: 3C26-27-1, 5D26-27-12)
  */
 export function formatStandardStudentCode(rawCode?: string, defaultClass: string = '4A', stt?: number): string {
+  const cleanCls = (defaultClass || '4A').replace(/^Lớp\s*/i, '').replace(/\s+/g, '').trim().toUpperCase() || '4A';
   if (!rawCode && !stt) {
-    const cleanCls = (defaultClass || '4A').replace(/^Lớp\s*/i, '').trim().toUpperCase();
     return `${cleanCls}26-27-1`;
   }
-  const clean = (rawCode || '').trim().toUpperCase();
+  const clean = normalizeStudentCode(rawCode || '');
   if (/^[A-Z0-9]+\d{2}-\d{2}-\d+$/.test(clean)) {
     return clean;
   }
@@ -121,22 +126,22 @@ export function formatStandardStudentCode(rawCode?: string, defaultClass: string
   if (legacyMatch) {
     const cls = legacyMatch[1].toUpperCase();
     const num = parseInt(legacyMatch[2], 10);
-    return `${cls}26-27-${num}`;
-  }
-  if (stt && typeof stt === 'number' && !isNaN(stt) && stt > 0) {
-    const cls = (defaultClass || '4A').replace(/^Lớp\s*/i, '').trim().toUpperCase();
-    return `${cls}26-27-${stt}`;
-  }
-  // Check if clean has ANY trailing number (e.g. "st-temp-7", "user-22", "hs-7")
-  const trailingNumMatch = clean.match(/(\d+)(?!.*\d)/);
-  if (trailingNumMatch) {
-    const num = parseInt(trailingNumMatch[1], 10);
-    if (!isNaN(num) && num > 0) {
-      const cls = (defaultClass || '4A').replace(/^Lớp\s*/i, '').trim().toUpperCase();
+    if (num > 0 && num < 10000) {
       return `${cls}26-27-${num}`;
     }
   }
-  return clean || `${(defaultClass || '4A').replace(/^Lớp\s*/i, '').trim().toUpperCase()}26-27-1`;
+  if (stt && typeof stt === 'number' && !isNaN(stt) && stt > 0) {
+    return `${cleanCls}26-27-${stt}`;
+  }
+  // Check if clean has a trailing number in valid STT range (e.g. "st-temp-7", "user-22", "hs-7")
+  const trailingNumMatch = clean.match(/(\d+)(?!.*\d)/);
+  if (trailingNumMatch) {
+    const num = parseInt(trailingNumMatch[1], 10);
+    if (!isNaN(num) && num > 0 && num <= 500) {
+      return `${cleanCls}26-27-${num}`;
+    }
+  }
+  return clean || `${cleanCls}26-27-1`;
 }
 
 /**

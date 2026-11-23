@@ -3,7 +3,7 @@ import { QuestionItem, ExamPaper, StudentRecord } from '../types';
 import { formatScore, formatTotalScore, roundTotalScore, formatSubmissionDateTime } from '../utils/scoreUtils';
 import { getExamCompletion } from './examCompletionService';
 import { getStudentsFromLocalStorage, generateDefaultClassRoster, getClassStudentCount } from './studentStorageService';
-import { formatStandardStudentCode, normalizeStudentCode } from './studentCode';
+import { formatStandardStudentCode, normalizeStudentCode, isValidStudentCode, parseStudentCode, generateStudentCode, normalizeStudentName } from './studentCode';
 import { sortStudentsByName } from '../utils/vietnameseNameSort';
 
 /**
@@ -473,6 +473,36 @@ export function importStudentsFromExcel(
     const parsedStudents: StudentRecord[] = [];
     const prefix = fallbackClass.replace(/Lớp\s*/i, '').trim().toUpperCase() || '4C';
 
+    // Tải danh sách học sinh hiện có của lớp để giữ nguyên Mã HS bất biến khi nhập lại danh sách lớp
+    const existingClassStudents = getStudentsFromLocalStorage(fallbackClass) || [];
+    const existingByCode = new Map<string, StudentRecord>();
+    const existingByNameDob = new Map<string, StudentRecord>();
+    const existingByNameCount = new Map<string, number>();
+    const existingByNameSingle = new Map<string, StudentRecord>();
+    const usedStts: number[] = [];
+
+    existingClassStudents.forEach((st) => {
+      const c = normalizeStudentCode(st.code || (st as any).studentCode || st.username || '');
+      if (c && isValidStudentCode(c)) {
+        existingByCode.set(c, st);
+        const parsed = parseStudentCode(c);
+        if (parsed && parsed.stt > 0) {
+          usedStts.push(parsed.stt);
+        }
+      }
+      const normName = normalizeStudentName(st.fullName || st.name || '');
+      const normDob = String(st.dob || (st as any).birthday || '').trim();
+      if (normName) {
+        if (normDob) {
+          existingByNameDob.set(`${normName}__${normDob}`, st);
+        }
+        existingByNameCount.set(normName, (existingByNameCount.get(normName) || 0) + 1);
+        existingByNameSingle.set(normName, st);
+      }
+    });
+
+    const assignedCodesInImport = new Set<string>();
+
     for (let i = startDataRow; i < rawRows.length; i++) {
       const row = rawRows[i];
       if (!Array.isArray(row) || row.length === 0) continue;
@@ -503,13 +533,62 @@ export function importStudentsFromExcel(
         continue;
       }
 
-      const sttNum =
+      const rowSttNum =
         (colIndices.stt >= 0 ? parseInt(String(row[colIndices.stt] || ''), 10) : NaN) || parsedStudents.length + 1;
-      const rawCodeFormatted = formatStandardStudentCode(rawUsername, prefix, sttNum);
-      const usernameVal = rawCodeFormatted;
+      const fullNameVal = rawFullName || `Học sinh ${rowSttNum}`;
+      const birthdayVal = colIndices.birthday >= 0 ? parseExcelDate(row[colIndices.birthday]) : '10/10/2016';
+
+      // Quy tắc Mã HS bất biến:
+      // 1. Nếu file Excel có cột Mã HS hợp lệ -> giữ nguyên Mã HS đó
+      // 2. Nếu không có cột Mã HS nhưng học sinh đã tồn tại trong lớp (khớp Họ tên + Ngày sinh hoặc Họ tên duy nhất) -> giữ nguyên Mã HS cũ của học sinh
+      // 3. Nếu là học sinh mới hoàn toàn: nếu lớp đã có danh sách -> cấp max(existingStt) + 1; nếu lớp trống hoàn toàn -> cấp theo STT dòng
+      let resolvedCode = '';
+      const cleanRawUsername = normalizeStudentCode(rawUsername);
+      if (cleanRawUsername && isValidStudentCode(cleanRawUsername) && !assignedCodesInImport.has(cleanRawUsername)) {
+        resolvedCode = cleanRawUsername;
+      } else if (cleanRawUsername) {
+        const candidateFormatted = normalizeStudentCode(formatStandardStudentCode(cleanRawUsername, prefix));
+        if (isValidStudentCode(candidateFormatted) && !assignedCodesInImport.has(candidateFormatted)) {
+          resolvedCode = candidateFormatted;
+        }
+      }
+
+      if (!resolvedCode && existingClassStudents.length > 0) {
+        const normName = normalizeStudentName(fullNameVal);
+        const byNameDob = existingByNameDob.get(`${normName}__${birthdayVal}`);
+        const byUniqueName = existingByNameCount.get(normName) === 1 ? existingByNameSingle.get(normName) : undefined;
+        const matchedExisting = byNameDob || byUniqueName;
+        if (matchedExisting) {
+          const existingCode = normalizeStudentCode(matchedExisting.code || (matchedExisting as any).studentCode || '');
+          if (existingCode && isValidStudentCode(existingCode) && !assignedCodesInImport.has(existingCode)) {
+            resolvedCode = existingCode;
+          }
+        }
+      }
+
+      if (!resolvedCode) {
+        if (existingClassStudents.length === 0 && !usedStts.includes(rowSttNum)) {
+          resolvedCode = formatStandardStudentCode('', prefix, rowSttNum);
+          usedStts.push(rowSttNum);
+        } else {
+          const gen = generateStudentCode(prefix, '2026-2027', usedStts);
+          resolvedCode = gen.code;
+          usedStts.push(gen.stt);
+        }
+      } else {
+        const parsed = parseStudentCode(resolvedCode);
+        if (parsed && parsed.stt > 0 && !usedStts.includes(parsed.stt)) {
+          usedStts.push(parsed.stt);
+        }
+      }
+
+      assignedCodesInImport.add(resolvedCode);
+      const parsedCodeObj = parseStudentCode(resolvedCode);
+      const codeSttNum = parsedCodeObj?.stt || rowSttNum;
+      const usernameVal = resolvedCode;
+
       const passwordVal =
         (colIndices.password >= 0 ? String(row[colIndices.password] || '').replace(/^'/, '').trim() : '') || '123456';
-      const fullNameVal = rawFullName || `Học sinh ${sttNum}`;
       const idCardVal =
         colIndices.idCard >= 0 ? String(row[colIndices.idCard] || '').replace(/^'/, '').trim() : '';
 
@@ -522,17 +601,16 @@ export function importStudentsFromExcel(
           ? 'Nữ'
           : 'Nam';
 
-      const birthdayVal = colIndices.birthday >= 0 ? parseExcelDate(row[colIndices.birthday]) : '10/10/2016';
       const parentNameVal = colIndices.parentName >= 0 ? String(row[colIndices.parentName] || '').trim() : '';
       const phoneVal = colIndices.phone >= 0 ? String(row[colIndices.phone] || '').replace(/^'/, '').trim() : '';
       const emailVal = usernameVal ? `hs.${usernameVal.toLowerCase()}@quanghungpk1.edu.vn` : '';
 
-      const avatarId = (sttNum % 10) + 1;
+      const avatarId = (codeSttNum % 10) + 1;
       const avatar = `https://images.unsplash.com/photo-${1535713875002 + avatarId}?w=100&auto=format&fit=crop`;
 
       const studentItem = {
-        id: `st-${prefix.toLowerCase()}-${sttNum}`,
-        stt: sttNum,
+        id: `st-${prefix.toLowerCase()}-${codeSttNum}`,
+        stt: rowSttNum,
         code: usernameVal,
         studentCode: usernameVal,
         username: usernameVal,
@@ -560,13 +638,13 @@ export function importStudentsFromExcel(
       parsedStudents.push(studentItem);
     }
 
-    // Deduplicate parsed students array to ensure strict key uniqueness
+    // Deduplicate parsed students array to ensure strict key uniqueness while preserving immutable code
     const seenParsedIds = new Set<string>();
     const seenParsedCodes = new Set<string>();
     const deduplicatedParsed: StudentRecord[] = [];
 
     parsedStudents.forEach((st) => {
-      const codeKey = (st.code || '').toLowerCase();
+      const codeKey = normalizeStudentCode(st.code || '');
       if (codeKey && seenParsedCodes.has(codeKey)) {
         return;
       }
@@ -575,15 +653,22 @@ export function importStudentsFromExcel(
     });
 
     const finalResult = deduplicatedParsed.map((st, idx) => {
-      const stt = idx + 1;
-      const id = `st-${prefix}-${stt}`;
+      const displayStt = idx + 1;
+      const immutableCode = normalizeStudentCode(st.code || (st as any).studentCode || `${prefix}26-27-${displayStt}`);
+      const parsedObj = parseStudentCode(immutableCode);
+      const codeStt = parsedObj?.stt || displayStt;
+      let id = `st-${prefix.toLowerCase()}-${codeStt}`;
+      if (seenParsedIds.has(id)) {
+        id = `st-${prefix.toLowerCase()}-${codeStt}-${displayStt}`;
+      }
       seenParsedIds.add(id);
       return {
         ...st,
         id,
-        stt,
-        code: st.code || `${prefix}${stt}`,
-        username: st.username || `${prefix}${stt}`
+        stt: displayStt,
+        code: immutableCode,
+        studentCode: immutableCode,
+        username: immutableCode
       };
     });
 

@@ -62,7 +62,19 @@ import { ConfirmDeleteModal } from '../common/ConfirmDeleteModal';
 import { getLocalCachedQuestions, QUESTIONS_CACHE_KEY, saveQuestionsBatchToFirestore } from '../../services/questionStorageService';
 import { useScoreSort } from '../../lib/useScoreSort';
 import { StudentAssignmentModule } from './StudentAssignmentModule';
-import { studentResultService, extractCleanStudentCode, getCandidateAssignmentIds, isMatchingStudentCode } from '../../services/studentResultService';
+import {
+  studentResultService,
+  extractCleanStudentCode,
+  getCandidateAssignmentIds,
+  isMatchingStudentCode,
+  getAssignmentResults,
+  getCachedAssignmentResults,
+  previewReassignUnmatchedSubmissions,
+  executeReassignUnmatchedSubmissionsBatch,
+  AssignmentResultsResponse,
+  UnmatchedSubmissionRecord,
+  ReassignPreviewResult
+} from '../../services/studentResultService';
 import { resetOrDeleteStudentAssignmentSubmission } from '../../services/studentSubmissionResetService';
 import { syncAssignmentQuestions } from '../../services/assignmentSyncService';
 import { getCurrentTeacherProfile, resolveCurrentTeacherProfile } from '../../services/teacherStorageService';
@@ -216,12 +228,18 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
   const [detailAssignment, setDetailAssignment] = useState<HomeworkAssignment | null>(null);
 
   // Tracking modal states
-  const [trackingTab, setTrackingTab] = useState<'all' | 'needs_action' | 'support'>('all');
+  const [trackingTab, setTrackingTab] = useState<'all' | 'needs_action' | 'support' | 'unmatched'>('all');
   const [needsActionSubFilter, setNeedsActionSubFilter] = useState<'all' | 'orange' | 'red'>('all');
   const [selectedStudentDetail, setSelectedStudentDetail] = useState<StudentSubmissionRow | null>(null);
   const [regradeToggle, setRegradeToggle] = useState(true);
   const [regradeScore, setRegradeScore] = useState('10');
   const [regradeComment, setRegradeComment] = useState('Chấm lại bởi AI thành công.');
+
+  // Canonical results map keyed by assignmentId (từ hàm chuẩn getAssignmentResults)
+  const [assignmentResultsMap, setAssignmentResultsMap] = useState<Record<string, AssignmentResultsResponse>>({});
+  const [detailResults, setDetailResults] = useState<AssignmentResultsResponse | null>(null);
+  const [reassignPreview, setReassignPreview] = useState<ReassignPreviewResult | null>(null);
+  const [isExecutingReassign, setIsExecutingReassign] = useState<boolean>(false);
 
   // Delete submission confirmation modal states
   const [deleteTarget, setDeleteTarget] = useState<StudentSubmissionRow | null>(null);
@@ -246,138 +264,58 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
     };
   }, [assignments]);
 
-  // Live submissions synced from Firestore subcollection & local records
+  // Live submissions synced from canonical getAssignmentResults (Read-only, 0 writes)
   const [liveSubmissions, setLiveSubmissions] = useState<any[]>([]);
   const [isSyncingSubmissions, setIsSyncingSubmissions] = useState(false);
   const [submissionSyncTick, setSubmissionSyncTick] = useState(0);
 
-  // Real-time synchronization for detailAssignment and its submissions from Firestore
-  useEffect(() => {
-    if (!detailAssignment?.id || !db) return;
-
-    let unsubDoc: (() => void) | undefined;
-    let unsubSubs: (() => void) | undefined;
-
-    try {
-      // 1. Listen to parent assignment document updates
-      const assignDocRef = doc(db, 'assignments', detailAssignment.id);
-      unsubDoc = onSnapshot(
-        assignDocRef,
-        (docSnap) => {
-          if (docSnap.exists()) {
-            const freshData = { id: docSnap.id, ...docSnap.data() } as HomeworkAssignment;
-            setDetailAssignment(prev => {
-              if (!prev || prev.id !== freshData.id) return prev;
-              return {
-                ...prev,
-                ...freshData,
-                questions: (freshData.questions && freshData.questions.length > 0) ? freshData.questions : prev.questions,
-                submissions: Array.isArray(freshData.submissions) ? freshData.submissions : (prev.submissions || [])
-              };
-            });
-          }
-        },
-        (err) => {
-          console.warn('Real-time assignment doc snapshot listener error:', err);
-        }
-      );
-    } catch (err) {
-      console.warn('Failed to attach assignment doc snapshot listener:', err);
-    }
-
-    try {
-      // 2. Real-time listener for subcollection: assignments/{id}/submissions
-      const subsCollRef = collection(db, 'assignments', detailAssignment.id, 'submissions');
-      unsubSubs = onSnapshot(
-        subsCollRef,
-        (snap) => {
-          const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-          if (docs.length > 0) {
-            setLiveSubmissions(prev => {
-              const map = new Map<string, any>();
-              prev.forEach((s: any) => {
-                const k = extractCleanStudentCode(s, s?.id);
-                if (k) map.set(k, s);
-              });
-              docs.forEach((s: any) => {
-                const k = extractCleanStudentCode(s, s?.id);
-                if (k) map.set(k, s);
-              });
-              return Array.from(map.values());
-            });
-            setSubmissionSyncTick(t => t + 1);
-          }
-        },
-        (err) => {
-          console.warn('Real-time subcollection submissions listener error:', err);
-        }
-      );
-    } catch (err) {
-      console.warn('Failed to attach subcollection submissions listener:', err);
-    }
-
-    return () => {
-      try {
-        if (unsubDoc) unsubDoc();
-      } catch {}
-      try {
-        if (unsubSubs) unsubSubs();
-      } catch {}
-    };
-  }, [detailAssignment?.id]);
-
-  // Comprehensive manual/automatic submission sync function (Read-only, strictly keyed by studentCode)
-  const handleSyncSubmissions = useCallback(async (showToastNotice = true) => {
+  // Tối ưu chi phí đọc: Mở bảng chi tiết chỉ đọc student_results của lớp đúng 1 lần (~38 lượt đọc),
+  // làm mới khi mở, đóng hoặc bấm "Làm mới". Tuyệt đối KHÔNG gắn onSnapshot liên tục và KHÔNG phát sinh lượt ghi (0 writes).
+  const handleSyncSubmissions = useCallback(async (showToastNotice = true, forceRefresh = true) => {
     if (!detailAssignment?.id) return;
     setIsSyncingSubmissions(true);
     try {
       const targetClass = detailAssignment.targetClass || 'Lớp 4C';
+      const isDebug = typeof window !== 'undefined' && window.location.search.includes('debug=1');
 
-      // 1. Đồng bộ danh sách học sinh của lớp từ Firestore (nếu có) để hiển thị tên học sinh tương ứng mã
-      try {
-        const localRoster = getStudentsFromLocalStorage(targetClass);
-        if (!localRoster || localRoster.length === 0) {
-          await fetchClassStudentsFromFirestore(targetClass);
-        }
-      } catch (rosterErr) {
-        console.warn('Không thể tải danh sách lớp từ Firestore:', rosterErr);
-      }
-
-      // 2. Truy vấn toàn bộ bài làm từ student_results, assignments/{id}/submissions, assignments/{id} & LocalStorage
-      // Đối chiếu DUY NHẤT theo Mã học sinh (studentCode viết hoa, trim khoảng trắng)
-      const allMerged = await studentResultService.fetchAssignmentSubmissionsByStudentCode(detailAssignment);
-
-      setLiveSubmissions(allMerged);
-      setDetailAssignment(prev => {
-        if (!prev || prev.id !== detailAssignment.id) return prev;
-        return {
-          ...prev,
-          submissions: allMerged,
-          submittedCount: allMerged.length,
-          completedCount: allMerged.length
-        };
+      const unifiedRes = await getAssignmentResults(detailAssignment.id, targetClass, {
+        assignment: detailAssignment,
+        forceRefresh,
+        includeDebugAudit: isDebug
       });
+
+      setDetailResults(unifiedRes);
+      setAssignmentResultsMap(prev => ({
+        ...prev,
+        [detailAssignment.id]: unifiedRes
+      }));
+      setLiveSubmissions(unifiedRes.matched);
       setSubmissionSyncTick(prev => prev + 1);
 
       if (showToastNotice) {
-        showToast(`✅ Đã đồng bộ kết quả nộp bài! Tìm thấy ${allMerged.length} bài nộp.`);
+        const unmatchedNote = unifiedRes.unmatchedCount > 0
+          ? ` (và ${unifiedRes.unmatchedCount} bài nộp chưa khớp danh sách lớp)`
+          : '';
+        showToast(`✅ Đã làm mới kết quả! Đã làm: ${unifiedRes.submittedCount}/${unifiedRes.totalStudents} học sinh${unmatchedNote}.`);
       }
     } catch (err) {
-      console.error('Lỗi khi đồng bộ kết quả bài tập:', err);
+      console.error('Lỗi khi tải kết quả bài tập:', err);
       if (showToastNotice) {
-        showToast('⚠️ Không thể đồng bộ kết quả, vui lòng thử lại.');
+        showToast('⚠️ Không thể tải kết quả, vui lòng thử lại.');
       }
     } finally {
       setIsSyncingSubmissions(false);
     }
   }, [detailAssignment, showToast]);
 
-  // Auto-sync once on detailAssignment open (Read-only, no Firestore write)
+  // Đọc đúng 1 lần khi mở bảng chi tiết (Read-only, 0 Firestore writes)
   useEffect(() => {
     if (detailAssignment?.id) {
-      handleSyncSubmissions(false);
+      handleSyncSubmissions(false, true);
     } else {
       setLiveSubmissions([]);
+      setDetailResults(null);
+      setReassignPreview(null);
     }
   }, [detailAssignment?.id]);
 
@@ -440,48 +378,32 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
 
       console.log(`[Delete Submission Success] Resetted/deleted submission for ${targetCode}:`, result);
 
-      // 1. Ngay lập tức cập nhật state danh sách kết quả liveSubmissions trên UI theo studentCode
-      setLiveSubmissions(prev =>
-        prev.filter((s: any) => !isMatchingStudentCode(targetCode, s, s?.id))
-      );
+      // 1. Ngay lập tức làm mới kết quả qua hàm chuẩn getAssignmentResults
+      const targetClass = detailAssignment.targetClass || 'Lớp 4C';
+      const isDebug = typeof window !== 'undefined' && window.location.search.includes('debug=1');
+      const refreshedRes = await getAssignmentResults(assignmentId, targetClass, {
+        assignment: detailAssignment,
+        forceRefresh: true,
+        includeDebugAudit: isDebug
+      });
 
-      // 2. Cập nhật detailAssignment.submissions và submittedIds ngay lập tức mà không cần tải lại trang
-      const currentSubs = Array.isArray(detailAssignment.submissions) ? detailAssignment.submissions : [];
-      const updatedSubs = currentSubs.filter(
-        (s: any) => !isMatchingStudentCode(targetCode, s, s?.id)
-      );
-      const currentSubmittedIds = Array.isArray(detailAssignment.submittedIds) ? detailAssignment.submittedIds : [];
-      const updatedSubmittedIds = currentSubmittedIds.filter(
-        (id: string) => !isMatchingStudentCode(targetCode, { studentCode: id }, id)
-      );
+      setDetailResults(refreshedRes);
+      setAssignmentResultsMap(prev => ({
+        ...prev,
+        [assignmentId]: refreshedRes
+      }));
+      setLiveSubmissions(refreshedRes.matched);
 
-      const updatedAssignment: HomeworkAssignment = {
-        ...detailAssignment,
-        submissions: updatedSubs,
-        submittedIds: updatedSubmittedIds,
-        submittedCount: Math.max(0, updatedSubs.length),
-        completedCount: Math.max(0, updatedSubs.length)
-      };
-
-      setDetailAssignment(updatedAssignment);
-
-      // 3. Đồng bộ lên state bài tập của ứng dụng cha
-      try {
-        onSaveAssignment(updatedAssignment);
-      } catch (saveErr) {
-        console.warn('Lỗi cập nhật state bài tập cha sau khi xóa bài nộp:', saveErr);
-      }
-
-      // 4. Nếu đang mở modal xem chi tiết bài làm của chính học sinh vừa xóa thì đóng lại
+      // 2. Nếu đang mở modal xem chi tiết bài làm của chính học sinh vừa xóa thì đóng lại
       setSelectedStudentDetail(prev => {
         if (!prev) return null;
         return isMatchingStudentCode(targetCode, { studentCode: prev.code }, prev.code) ? null : prev;
       });
 
-      // 5. Tăng tick để tính toán lại bảng Theo dõi nộp bài ngay lập tức
+      // 3. Tăng tick để tính toán lại bảng Theo dõi nộp bài ngay lập tức
       setSubmissionSyncTick(tick => tick + 1);
 
-      // 6. Đóng hộp thoại xác nhận xóa và hiển thị thông báo thành công thân thiện
+      // 4. Đóng hộp thoại xác nhận xóa và hiển thị thông báo thành công thân thiện
       setDeleteTarget(null);
       showToast(`✅ Đã xóa kết quả bài làm của mã học sinh ${targetCode} (${targetName})`);
     } catch (err: any) {
@@ -493,54 +415,50 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
     }
   };
 
-  // Helper calculating authentic unique submitted student count strictly by studentCode
+  // Quy ước đếm "Đã làm":
+  // "Đã làm" = số học sinh TRONG DANH SÁCH LỚP có bài nộp (matched.length), tính trực tiếp từ getAssignmentResults.
+  // Ngừng đọc và ngừng ghi các trường đếm lưu sẵn (completedCount, submittedCount, submissionsCount).
   const getAssignmentSubmissionCount = useCallback((as: HomeworkAssignment): number => {
-    if (!as) return 0;
-    const uniqueStudentCodes = new Set<string>();
+    if (!as?.id) return 0;
 
-    const addSubKey = (s: any, fallbackId?: string) => {
-      if (!s && !fallbackId) return;
-      const code = extractCleanStudentCode(s, fallbackId);
-      if (code) uniqueStudentCodes.add(code);
+    // 1. Ưu tiên kết quả chuẩn đã nạp từ getAssignmentResults
+    const fromState = assignmentResultsMap[as.id];
+    if (fromState) {
+      return fromState.submittedCount;
+    }
+    const fromCache = getCachedAssignmentResults(as.id, as.targetClass);
+    if (fromCache) {
+      return fromCache.submittedCount;
+    }
+
+    // 2. Trong lúc đang tải getAssignmentResults lần đầu, đối chiếu tạm các bản ghi trên bộ nhớ với danh sách lớp hiện tại (KHÔNG đọc completedCount/submittedCount)
+    const classRoster = getStudentsFromLocalStorage(as.targetClass || 'Lớp 4C') || [];
+    const rosterCodes = new Set<string>(
+      classRoster
+        .map(st => normalizeStudentCode(st.code || (st as any).studentCode || st.username || ''))
+        .filter(Boolean)
+    );
+
+    if (rosterCodes.size === 0) return 0;
+
+    const matchedRosterCodes = new Set<string>();
+    const addIfInRoster = (s: any, fallbackId?: string) => {
+      const code = normalizeStudentCode(extractCleanStudentCode(s, fallbackId));
+      if (code && rosterCodes.has(code)) {
+        matchedRosterCodes.add(code);
+      }
     };
 
-    // 1. as.submissions
-    const subs = Array.isArray(as.submissions) ? as.submissions : [];
-    subs.forEach(s => addSubKey(s));
-
-    // 2. submittedIds
-    if (Array.isArray(as.submittedIds)) {
-      as.submittedIds.forEach((id: string) => {
-        if (id) addSubKey({ studentCode: id }, id);
-      });
+    if (Array.isArray(as.submissions)) {
+      as.submissions.forEach(s => addIfInRoster(s));
     }
 
-    // 3. If this is detailAssignment, include liveSubmissions
     if (detailAssignment && detailAssignment.id === as.id && Array.isArray(liveSubmissions)) {
-      liveSubmissions.forEach(s => addSubKey(s));
+      liveSubmissions.forEach(s => addIfInRoster(s));
     }
 
-    // 4. Scan localStorage for any submissions matching this assignment
-    if (typeof window !== 'undefined') {
-      const candIds = new Set(getCandidateAssignmentIds(as));
-      try {
-        for (const cid of candIds) {
-          const rawExamSubs = localStorage.getItem(`eduplay_k4_exam_subs_${cid}`);
-          if (rawExamSubs) {
-            const parsed = JSON.parse(rawExamSubs);
-            if (Array.isArray(parsed)) {
-              parsed.forEach(s => addSubKey(s));
-            }
-          }
-        }
-      } catch {}
-    }
-
-    if (uniqueStudentCodes.size > 0) return uniqueStudentCodes.size;
-    if (typeof as.submittedCount === 'number' && as.submittedCount > 0) return as.submittedCount;
-    if (typeof as.completedCount === 'number' && as.completedCount > 0) return as.completedCount;
-    return 0;
-  }, [detailAssignment, liveSubmissions, submissionSyncTick]);
+    return matchedRosterCodes.size;
+  }, [assignmentResultsMap, detailAssignment, liveSubmissions, submissionSyncTick]);
 
   // Dynamic tracking students derived from detailAssignment submissions and class roster
   // LƯU VÀ ĐỐI CHIẾU DUY NHẤT THEO MÃ HỌC SINH (studentCode viết hoa, trim khoảng trắng), TUYỆT ĐỐI KHÔNG SO KHỚP TÊN HỌC SINH
@@ -831,40 +749,7 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
       const hasOrangeAlert = errorDetails.length > 0;
       const hasRedAlert = typeof numericScoreVal === 'number' && numericScoreVal < LOW_SCORE_THRESHOLD;
 
-      if (hasOrangeAlert) {
-        createNotificationIfNotExists({
-          teacherId: effectiveTeacherId,
-          studentId: stCode,
-          studentCode: stCode,
-          studentName: stName,
-          assignmentId: detailAssignment.id,
-          assignmentTitle: detailAssignment.title,
-          type: 'ai_failed',
-          message: `Bài làm của ${stName} (${stCode}) có ${errorDetails.length} câu AI chưa chấm được.`,
-          targetClass: detailAssignment.targetClass,
-          details: {
-            failedQuestionIndexes: errorDetails.map(e => e.questionIndex),
-            gradeNotes: errorDetails.map(e => e.note)
-          }
-        });
-      }
-
-      if (hasRedAlert) {
-        createNotificationIfNotExists({
-          teacherId: effectiveTeacherId,
-          studentId: stCode,
-          studentCode: stCode,
-          studentName: stName,
-          assignmentId: detailAssignment.id,
-          assignmentTitle: detailAssignment.title,
-          type: 'low_score',
-          message: `Học sinh ${stName} (${stCode}) làm bài đạt điểm dưới ${LOW_SCORE_THRESHOLD} (${numericScoreVal} điểm).`,
-          targetClass: detailAssignment.targetClass,
-          details: {
-            score: numericScoreVal
-          }
-        });
-      }
+      // Tuyệt đối KHÔNG gọi createNotificationIfNotExists bên trong useMemo để đảm bảo mở màn hình/lọc/F5 có 0 lượt ghi Firestore.
 
       return {
         code: stCode,
@@ -889,19 +774,21 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
       };
     };
 
-    const processedCodes = new Set<string>();
+    const effectiveRoster =
+      detailResults?.roster && detailResults.roster.length > 0
+        ? detailResults.roster
+        : classStudentsRoster;
 
-    // Bước 1: Duyệt theo danh sách lớp (nếu đã có danh sách lớp), đối chiếu DUY NHẤT qua studentCode
-    const resultList: StudentSubmissionRow[] = classStudentsRoster.map((st, idx) => {
-      const rawCode = st.code || st.id || `st-${idx + 1}`;
-      const normCode = extractCleanStudentCode({ studentCode: rawCode }, rawCode) || normalizeStudentCode(rawCode);
+    // Bảng danh sách chính CHỈ hiển thị đúng học sinh trong danh sách lớp hiện tại (matched + waiting).
+    // Các bài nộp chưa khớp danh sách lớp (unmatched, ví dụ 3D26-27-80) được hiển thị riêng ở mục "Bài nộp chưa khớp".
+    const resultList: StudentSubmissionRow[] = effectiveRoster.map((st, idx) => {
+      const rawCode = st.code || (st as any).studentCode || st.id || `st-${idx + 1}`;
+      const normCode = normalizeStudentCode(extractCleanStudentCode({ studentCode: rawCode }, rawCode) || rawCode);
       const stdFormatted = normalizeStudentCode(formatStandardStudentCode(rawCode, targetClassName));
 
-      if (normCode) processedCodes.add(normCode);
-      if (stdFormatted) processedCodes.add(stdFormatted);
-
-      // TUYỆT ĐỐI chỉ tìm theo Mã học sinh (normCode / stdFormatted), KHÔNG tìm theo tên học sinh
       const submission =
+        (normCode && detailResults?.matchedByCode?.[normCode]) ||
+        (stdFormatted && detailResults?.matchedByCode?.[stdFormatted]) ||
         (normCode && subMap.get(normCode)) ||
         (stdFormatted && subMap.get(stdFormatted)) ||
         null;
@@ -924,27 +811,6 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
       };
     });
 
-    // Bước 2: Bổ sung TẤT CẢ các bài nộp trong subMap mà Mã học sinh chưa nằm trong classStudentsRoster
-    // (Đảm bảo dù danh sách lớp trống 0 học sinh, chưa đồng bộ, hoặc khác tên lớp/họ tên thì bảng VẪN HIỂN THỊ ĐẦY ĐỦ kết quả!)
-    subMap.forEach((submission, normCode) => {
-      if (!normCode || processedCodes.has(normCode)) return;
-      processedCodes.add(normCode);
-
-      const stdFormatted = normalizeStudentCode(formatStandardStudentCode(normCode, targetClassName));
-      if (stdFormatted) processedCodes.add(stdFormatted);
-
-      const rosterSt = rosterByCode.get(normCode) || (stdFormatted ? rosterByCode.get(stdFormatted) : null);
-      const displayName =
-        rosterSt?.name ||
-        rosterSt?.fullName ||
-        submission.studentName ||
-        submission.name ||
-        submission.fullName ||
-        `Học sinh (${normCode})`;
-
-      resultList.push(buildSubmittedStudentRow(normCode, displayName, submission));
-    });
-
     if (detailAssignment?.id) {
       try {
         setMemoryTrackingData(detailAssignment.id, {
@@ -952,6 +818,7 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
           targetClass: targetClassName,
           totalStudents: resultList.length,
           submittedCount: resultList.filter(s => s.status === 'submitted').length,
+          unmatchedSubmissionsCount: detailResults?.unmatchedCount || 0,
           trackingList: resultList as any,
           timestamp: Date.now()
         });
@@ -959,7 +826,7 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
     }
 
     return resultList;
-  }, [detailAssignment, liveSubmissions, submissionSyncTick]);
+  }, [detailAssignment, detailResults, liveSubmissions, submissionSyncTick]);
 
   const filteredTrackingStudents = useMemo(() => {
     if (trackingTab === 'needs_action') {
@@ -1981,6 +1848,80 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
   const startIndex = (currentPage - 1) * itemsPerPage;
   const paginatedAssignments = filteredAssignments.slice(startIndex, startIndex + itemsPerPage);
 
+  // Tải kết quả chuẩn từ getAssignmentResults cho các bài tập đang hiển thị (0 lượt ghi Firestore)
+  useEffect(() => {
+    let isCancelled = false;
+    const loadVisibleResults = async () => {
+      const updates: Record<string, AssignmentResultsResponse> = {};
+      for (const as of paginatedAssignments) {
+        if (!as.id) continue;
+        const targetCls = as.targetClass || 'Lớp 4C';
+        const existing = assignmentResultsMap[as.id];
+        if (existing && (!isDebugMode || existing.storageBreakdown.assignmentEmbeddedArray >= 0)) {
+          continue;
+        }
+        try {
+          const res = await getAssignmentResults(as.id, targetCls, {
+            assignment: as,
+            includeDebugAudit: isDebugMode
+          });
+          updates[as.id] = res;
+        } catch (err) {
+          console.warn('[AssignmentModule] Không thể tải getAssignmentResults cho bài:', as.id, err);
+        }
+      }
+      if (!isCancelled && Object.keys(updates).length > 0) {
+        setAssignmentResultsMap(prev => ({ ...prev, ...updates }));
+      }
+    };
+    loadVisibleResults();
+    return () => {
+      isCancelled = true;
+    };
+  }, [paginatedAssignments.map(a => `${a.id}:${a.targetClass}`).join('|'), isDebugMode]);
+
+  const handleOpenReassignPreview = () => {
+    if (!detailAssignment || !detailResults) return;
+    try {
+      const preview = previewReassignUnmatchedSubmissions(
+        detailAssignment.id,
+        detailAssignment.targetClass || 'Lớp 4C',
+        detailResults.unmatched || [],
+        detailResults.roster || [],
+        detailResults.matchedByCode || {}
+      );
+      setReassignPreview(preview);
+    } catch (err) {
+      console.error('[ReassignPreview] Error:', err);
+      showToast('Không thể tạo bản xem trước gán lại Mã HS!');
+    }
+  };
+
+  const handleExecuteReassignBatch = async () => {
+    if (!detailAssignment || !reassignPreview || reassignPreview.canReassign.length === 0) return;
+    setIsExecutingReassign(true);
+    try {
+      const res = await executeReassignUnmatchedSubmissionsBatch(
+        detailAssignment.id,
+        reassignPreview.canReassign
+      );
+      const refreshed = await getAssignmentResults(
+        detailAssignment.id,
+        detailAssignment.targetClass || 'Lớp 4C',
+        { assignment: detailAssignment, forceRefresh: true, includeDebugAudit: true }
+      );
+      setDetailResults(refreshed);
+      setAssignmentResultsMap(prev => ({ ...prev, [detailAssignment.id]: refreshed }));
+      setReassignPreview(null);
+      showToast(`Đã gán lại thành công ${res.ReassignedCount} bài nộp vào Mã HS chuẩn (giữ nguyên bản ghi gốc)!`);
+    } catch (err) {
+      console.error('[ReassignExecute] Error:', err);
+      showToast('Lỗi khi thực thi gán lại bài nộp!');
+    } finally {
+      setIsExecutingReassign(false);
+    }
+  };
+
   // Create Assignment handler
   const handleSaveForm = () => {
     setFormDateError(null);
@@ -2105,33 +2046,29 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
     setOpenActionMenuId(null);
   };
 
-  // Student submission handler
+  // Student submission handler (chỉ ghi duy nhất vào student_results/{Mã HS chuẩn})
   const handleStudentSubmit = async () => {
     if (!solvingAssignment || !studentContent.trim() || !currentUserId) return;
 
-    const newSubmission: AssignmentSubmission = {
-      id: `sub-${Date.now()}`,
-      studentId: currentUserId,
-      studentName: currentUserName || 'Học sinh',
-      submittedAt: new Date().toLocaleString('vi-VN'),
-      content: studentContent,
-      status: 'pending'
-    };
-
-    const updated: HomeworkAssignment = {
-      ...solvingAssignment,
-      completedCount: (solvingAssignment.completedCount || 0) + 1,
-      submissions: [newSubmission, ...solvingAssignment.submissions]
-    };
-
+    const cleanCode = normalizeStudentCode(currentUserId);
     try {
-      // Lưu trực tiếp vào Firestore
-      await studentResultService.saveFullAssignmentSubmission(currentUserId, solvingAssignment.id, newSubmission);
-      
-      onSaveAssignment(updated);
+      await studentResultService.saveAssignmentResult(cleanCode, {
+        assignmentId: solvingAssignment.id,
+        title: solvingAssignment.title,
+        subject: solvingAssignment.subject,
+        studentName: currentUserName || 'Học sinh',
+        studentClass: solvingAssignment.targetClass || '',
+        score: 0,
+        maxScore: 10,
+        totalQuestions: solvingAssignment.questions?.length || 0,
+        gradingStatus: 'pending',
+        submittedAt: new Date().toISOString(),
+        answers: {}
+      });
+
       setSolvingAssignment(null);
       setStudentContent('');
-      showToast('Nộp bài tập thành công! Giáo viên và Gemini AI sẽ chấm bài sớm.');
+      showToast('Nộp bài tập thành công! Giáo viên và hệ thống sẽ chấm bài sớm.');
     } catch (err) {
       console.error('Lỗi khi nộp bài tập:', err);
       showToast('Nộp bài thất bại, vui lòng thử lại!');
@@ -2287,25 +2224,27 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
               <Clock className="w-4 h-4 text-indigo-600" />
               <span>Rà soát & Chuẩn hóa Hạn nộp</span>
             </button>
-            {isDebugMode && (
-              <button
-                onClick={() => setIsScanDuplicatesModalOpen(true)}
-                className="px-3.5 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-sm transition-all"
-                title="Quét các bài tập giao trùng lặp và xem trước phương án gộp"
-              >
-                <Search className="w-4 h-4" />
-                <span>Quét bài giao trùng (Debug)</span>
-              </button>
+            {isDebugMode && isAdmin && (
+              <>
+                <button
+                  onClick={() => setIsScanDuplicatesModalOpen(true)}
+                  className="px-3.5 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-sm transition-all"
+                  title="Quét các bài tập giao trùng lặp và xem trước phương án gộp"
+                >
+                  <Search className="w-4 h-4" />
+                  <span>Quét bài giao trùng (Debug)</span>
+                </button>
+                <button
+                  onClick={handleSyncAllAssignments}
+                  disabled={isSyncingAll}
+                  className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold flex items-center gap-2 cursor-pointer shadow-sm transition-all disabled:opacity-50"
+                  title="[Công cụ sửa lỗi Admin ?debug=1] Đồng bộ lại câu hỏi mới nhất từ đề gốc hoặc ngân hàng cho tất cả bài tập đã giao"
+                >
+                  <RefreshCw className={`w-4 h-4 ${isSyncingAll ? 'animate-spin' : ''}`} />
+                  <span>{isSyncingAll ? 'Đang đồng bộ...' : 'Đồng bộ câu hỏi từ đề gốc (Debug)'}</span>
+                </button>
+              </>
             )}
-            <button
-              onClick={handleSyncAllAssignments}
-              disabled={isSyncingAll}
-              className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold flex items-center gap-2 cursor-pointer shadow-sm transition-all disabled:opacity-50"
-              title="Đồng bộ lại câu hỏi mới nhất từ đề gốc hoặc ngân hàng cho tất cả bài tập đã giao"
-            >
-              <RefreshCw className={`w-4 h-4 ${isSyncingAll ? 'animate-spin' : ''}`} />
-              <span>{isSyncingAll ? 'Đang đồng bộ...' : 'Đồng bộ câu hỏi từ đề gốc'}</span>
-            </button>
             <button
               onClick={() => setIsBankAssignmentModalOpen(true)}
               className="px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white rounded-xl text-xs font-bold flex items-center gap-2 cursor-pointer shadow-sm transition-all"
@@ -2315,6 +2254,80 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
             </button>
           </div>
         </div>
+
+        {/* BẢNG ĐỐI CHIẾU DỮ LIỆU (?debug=1) */}
+        {isDebugMode && (
+          <div className="p-4 rounded-2xl bg-slate-900 text-slate-100 border border-indigo-500/40 space-y-2.5 text-xs shadow-md">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div className="font-extrabold text-amber-300 flex items-center gap-2">
+                <span>🛠️ Bảng đối chiếu nơi lưu & con số hiển thị (?debug=1)</span>
+              </div>
+              <span className="text-[11px] text-slate-300">
+                Nguồn chuẩn: <code className="text-emerald-300 font-mono">getAssignmentResults(assignmentId, classCode)</code> • 0 lượt ghi khi mở màn hình
+              </span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-[11px]">
+                <thead>
+                  <tr className="border-b border-slate-700 text-slate-300 uppercase">
+                    <th className="py-1.5 px-2">Bài tập</th>
+                    <th className="py-1.5 px-2 text-center">Lớp (Sĩ số)</th>
+                    <th className="py-1.5 px-2 text-center">student_results (Map chuẩn)</th>
+                    <th className="py-1.5 px-2 text-center">Khóa chấm cũ / Flat / Sub</th>
+                    <th className="py-1.5 px-2 text-center">assignments.submissions (Mảng/Sub)</th>
+                    <th className="py-1.5 px-2 text-center">completedCount lưu sẵn (Cũ)</th>
+                    <th className="py-1.5 px-2 text-center text-emerald-300">Khớp DS lớp</th>
+                    <th className="py-1.5 px-2 text-center text-amber-300">Chưa khớp</th>
+                    <th className="py-1.5 px-2 text-center">DS Ngoài / Chi tiết / Excel</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800">
+                  {paginatedAssignments.map(as => {
+                    const res = assignmentResultsMap[as.id];
+                    const sb = res?.storageBreakdown;
+                    const matchedCnt = res?.submittedCount ?? 0;
+                    const unmatchedCnt = res?.unmatchedCount ?? 0;
+                    const rosterCnt = res?.totalStudents ?? 0;
+                    const outerCnt = getAssignmentSubmissionCount(as);
+                    const legacyStoredCount = typeof as.completedCount === 'number' ? as.completedCount : 0;
+                    const hasLegacyMismatch =
+                      (sb && (sb.studentResultsCanonicalMap !== matchedCnt + unmatchedCnt || sb.assignmentEmbeddedArray !== matchedCnt)) ||
+                      legacyStoredCount !== matchedCnt ||
+                      outerCnt !== matchedCnt;
+
+                    return (
+                      <tr key={as.id} className={hasLegacyMismatch ? 'bg-amber-950/30' : ''}>
+                        <td className="py-1.5 px-2 font-bold text-white">{as.title}</td>
+                        <td className="py-1.5 px-2 text-center">{as.targetClass} ({rosterCnt})</td>
+                        <td className={`py-1.5 px-2 text-center ${sb && sb.studentResultsCanonicalMap !== matchedCnt ? 'font-black text-amber-300' : ''}`}>
+                          {sb ? sb.studentResultsCanonicalMap : '...'}
+                        </td>
+                        <td className={`py-1.5 px-2 text-center ${sb && (sb.studentResultsDottedField > 0 || sb.studentResultsFlatDocs > 0 || sb.studentResultsSubcollectionDocs > 0) ? 'font-black text-amber-300' : 'text-slate-400'}`}>
+                          {sb ? `${sb.studentResultsDottedField} / ${sb.studentResultsFlatDocs} / ${sb.studentResultsSubcollectionDocs}` : '...'}
+                        </td>
+                        <td className={`py-1.5 px-2 text-center ${sb && (sb.assignmentEmbeddedArray !== matchedCnt || sb.assignmentSubcollectionDocs !== matchedCnt) ? 'font-black text-rose-300' : 'text-slate-400'}`}>
+                          {sb ? `${sb.assignmentEmbeddedArray} / ${sb.assignmentSubcollectionDocs}` : `${as.submissions?.length || 0} / -`}
+                        </td>
+                        <td className={`py-1.5 px-2 text-center ${legacyStoredCount !== matchedCnt ? 'font-black text-rose-400' : 'text-slate-400'}`}>
+                          {legacyStoredCount}
+                        </td>
+                        <td className="py-1.5 px-2 text-center font-black text-emerald-400">
+                          {matchedCnt}/{rosterCnt}
+                        </td>
+                        <td className={`py-1.5 px-2 text-center ${unmatchedCnt > 0 ? 'font-black text-amber-400' : 'text-slate-400'}`}>
+                          {unmatchedCnt}
+                        </td>
+                        <td className={`py-1.5 px-2 text-center ${outerCnt !== matchedCnt ? 'font-black text-rose-400' : 'font-bold text-emerald-300'}`}>
+                          {outerCnt} / {matchedCnt} / {matchedCnt}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
 
         {/* UseQuestionBankModal for AssignmentModule */}
         <UseQuestionBankModal
@@ -3751,31 +3764,41 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
                   Bài tập: <span className="font-extrabold text-slate-800">{detailAssignment.title || 'Bài tập: Luyện tập Khối 4'}</span>
                   <span className="mx-2 text-slate-300">•</span>
                   Sĩ số {detailAssignment.targetClass ? (detailAssignment.targetClass.startsWith('Lớp') ? detailAssignment.targetClass : `Lớp ${detailAssignment.targetClass}`) : 'Lớp 4C'}: <span className="font-extrabold text-indigo-900">{trackingStudentsList.length} học sinh</span>
+                  <span className="mx-2 text-slate-300">•</span>
+                  Đã làm: <span className="font-extrabold text-emerald-700">{detailResults?.submittedCount ?? trackingStudentsList.filter(s => s.status === 'submitted').length}/{trackingStudentsList.length}</span>
+                  {(detailResults?.unmatchedCount || 0) > 0 && (
+                    <>
+                      <span className="mx-2 text-slate-300">•</span>
+                      <span className="font-extrabold text-amber-700">Chưa khớp DS lớp: {detailResults?.unmatchedCount}</span>
+                    </>
+                  )}
                 </p>
               </div>
 
-              <div className="flex items-center gap-2 self-end sm:self-auto">
+              <div className="flex items-center gap-2 self-end sm:self-auto flex-wrap">
                 <button
                   type="button"
                   onClick={() => handleSyncSubmissions(true)}
                   disabled={isSyncingSubmissions}
                   className="px-3.5 py-2 rounded-xl text-xs font-bold bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 shadow-2xs transition-all flex items-center gap-1.5 cursor-pointer active:scale-95 disabled:opacity-50"
-                  title="Làm mới và đồng bộ kết quả nộp bài mới nhất từ học sinh"
+                  title="Tải lại kết quả bài làm mới nhất từ student_results (0 lượt ghi Firestore)"
                 >
                   <RefreshCw className={`w-3.5 h-3.5 text-sky-600 ${isSyncingSubmissions ? 'animate-spin' : ''}`} />
-                  <span>Đồng bộ kết quả</span>
+                  <span>{isDebugMode ? 'Làm mới / Đồng bộ kết quả' : 'Làm mới'}</span>
                 </button>
 
-                <button
-                  type="button"
-                  onClick={() => handleSyncAssignment(detailAssignment)}
-                  disabled={syncingAssignmentId === detailAssignment.id}
-                  className="px-3.5 py-2 rounded-xl text-xs font-bold bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 shadow-2xs transition-all flex items-center gap-1.5 cursor-pointer active:scale-95 disabled:opacity-50"
-                  title="Đồng bộ cập nhật câu hỏi mới nhất từ đề gốc hoặc ngân hàng"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${syncingAssignmentId === detailAssignment.id ? 'animate-spin' : ''}`} />
-                  <span>Đồng bộ câu hỏi ({detailAssignment.questions?.length || 0})</span>
-                </button>
+                {isDebugMode && isAdmin && (
+                  <button
+                    type="button"
+                    onClick={() => handleSyncAssignment(detailAssignment)}
+                    disabled={syncingAssignmentId === detailAssignment.id}
+                    className="px-3.5 py-2 rounded-xl text-xs font-bold bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 shadow-2xs transition-all flex items-center gap-1.5 cursor-pointer active:scale-95 disabled:opacity-50"
+                    title="[Công cụ sửa lỗi Admin ?debug=1] Đồng bộ cập nhật câu hỏi mới nhất từ đề gốc hoặc ngân hàng"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${syncingAssignmentId === detailAssignment.id ? 'animate-spin' : ''}`} />
+                    <span>Đồng bộ câu hỏi ({detailAssignment.questions?.length || 0})</span>
+                  </button>
+                )}
 
                 <button
                   onClick={handleExportExcel}
@@ -3859,6 +3882,21 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
                         <HeartHandshake className="w-3.5 h-3.5 text-rose-600" />
                         <span>🆘 Danh sách hỗ trợ ({supportCount})</span>
                       </button>
+
+                      <button
+                        onClick={() => setTrackingTab('unmatched')}
+                        className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+                          trackingTab === 'unmatched'
+                            ? 'bg-purple-100 text-purple-950 border border-purple-300 shadow-2xs'
+                            : (detailResults?.unmatchedCount || 0) > 0
+                            ? 'bg-purple-50 text-purple-800 hover:bg-purple-100 border border-purple-300'
+                            : 'bg-white text-slate-600 hover:bg-slate-100 border border-slate-200'
+                        }`}
+                        title="Các bài nộp có Mã HS không nằm trong danh sách lớp hiện tại (không bị mất bài, không tính gộp vào sĩ số lớp)"
+                      >
+                        <AlertCircle className="w-3.5 h-3.5 text-purple-600" />
+                        <span>Bài nộp chưa khớp ({detailResults?.unmatchedCount || 0})</span>
+                      </button>
                     </div>
 
                     <div className="text-[11px] text-slate-500 italic font-medium flex items-center gap-1">
@@ -3904,11 +3942,206 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
                       </button>
                     </div>
                   )}
+                  {/* Bảng đối chiếu chi tiết trong Modal khi bật ?debug=1 */}
+                  {isDebugMode && detailResults && (
+                    <div className="p-3 rounded-xl bg-slate-900 text-slate-100 border border-indigo-500/40 text-[11px] space-y-1.5">
+                      <div className="flex items-center justify-between flex-wrap gap-2">
+                        <span className="font-extrabold text-amber-300">
+                          🔍 Đối chiếu nguồn dữ liệu bài "{detailAssignment.title}" ({detailAssignment.targetClass})
+                        </span>
+                        <span className="text-slate-300">
+                          Số lượt đọc Firestore lần mở này: <strong className="text-emerald-300">{detailResults.firestoreReadsCount} reads</strong> • 0 writes
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2 pt-1">
+                        <div className="bg-slate-800/90 p-2 rounded-lg">
+                          <div className="text-slate-400">Map chuẩn</div>
+                          <div className="font-black text-emerald-300 text-sm">{detailResults.storageBreakdown.studentResultsCanonicalMap}</div>
+                        </div>
+                        <div className="bg-slate-800/90 p-2 rounded-lg">
+                          <div className="text-slate-400">Khóa chấm cũ</div>
+                          <div className={`text-sm ${detailResults.storageBreakdown.studentResultsDottedField > 0 ? 'font-black text-amber-300' : 'text-slate-300'}`}>
+                            {detailResults.storageBreakdown.studentResultsDottedField}
+                          </div>
+                        </div>
+                        <div className="bg-slate-800/90 p-2 rounded-lg">
+                          <div className="text-slate-400">Doc phẳng / Sub</div>
+                          <div className={`text-sm ${(detailResults.storageBreakdown.studentResultsFlatDocs + detailResults.storageBreakdown.studentResultsSubcollectionDocs) > 0 ? 'font-black text-amber-300' : 'text-slate-300'}`}>
+                            {detailResults.storageBreakdown.studentResultsFlatDocs} / {detailResults.storageBreakdown.studentResultsSubcollectionDocs}
+                          </div>
+                        </div>
+                        <div className="bg-slate-800/90 p-2 rounded-lg">
+                          <div className="text-slate-400">assignments.submissions</div>
+                          <div className={`text-sm ${detailResults.storageBreakdown.assignmentEmbeddedArray !== detailResults.submittedCount ? 'font-black text-rose-400' : 'text-slate-300'}`}>
+                            {detailResults.storageBreakdown.assignmentEmbeddedArray} (sub: {detailResults.storageBreakdown.assignmentSubcollectionDocs})
+                          </div>
+                        </div>
+                        <div className="bg-slate-800/90 p-2 rounded-lg">
+                          <div className="text-slate-400">Khớp DS lớp</div>
+                          <div className="font-black text-emerald-400 text-sm">
+                            {detailResults.submittedCount}/{detailResults.totalStudents}
+                          </div>
+                        </div>
+                        <div className="bg-slate-800/90 p-2 rounded-lg">
+                          <div className="text-slate-400">Chưa khớp</div>
+                          <div className={`text-sm ${detailResults.unmatchedCount > 0 ? 'font-black text-amber-400' : 'text-slate-300'}`}>
+                            {detailResults.unmatchedCount}
+                          </div>
+                        </div>
+                        <div className="bg-slate-800/90 p-2 rounded-lg">
+                          <div className="text-slate-400">DS ngoài / Chi tiết</div>
+                          <div className={`text-sm ${getAssignmentSubmissionCount(detailAssignment) !== detailResults.submittedCount ? 'font-black text-rose-400' : 'font-bold text-emerald-300'}`}>
+                            {getAssignmentSubmissionCount(detailAssignment)} / {trackingStudentsList.filter(s => s.status === 'submitted').length}
+                          </div>
+                        </div>
+                        <div className="bg-slate-800/90 p-2 rounded-lg">
+                          <div className="text-slate-400">DS Hỗ trợ / Excel</div>
+                          <div className="font-bold text-emerald-300 text-sm">
+                            {supportCount} / {trackingStudentsList.filter(s => s.status === 'submitted').length}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
               );
             })()}
 
-            {/* 3. STUDENT SUBMISSION TABLE */}
+            {/* 3. BẢNG "BÀI NỘP CHƯA KHỚP" HOẶC BẢNG HỌC SINH TRONG DANH SÁCH LỚP */}
+            {trackingTab === 'unmatched' ? (
+              <div className="flex-1 overflow-x-auto border border-purple-200 rounded-2xl max-h-[52vh] overflow-y-auto bg-white shadow-2xs p-4 space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2 border-b border-purple-100">
+                  <div>
+                    <h4 className="text-xs font-extrabold text-purple-950 flex items-center gap-1.5">
+                      <AlertCircle className="w-4 h-4 text-purple-600" />
+                      <span>Danh sách bài nộp có Mã HS chưa khớp với danh sách lớp hiện tại ({detailResults?.unmatchedCount || 0} bài)</span>
+                    </h4>
+                    <p className="text-[11px] text-slate-500 mt-0.5">
+                      Các bài nộp này được giữ nguyên vẹn trong <code className="font-mono text-purple-700">student_results</code>, không bị xóa và không cộng lẫn vào sĩ số lớp.
+                    </p>
+                  </div>
+                  {isAdmin && (detailResults?.unmatchedCount || 0) > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleOpenReassignPreview}
+                      className="px-3.5 py-2 rounded-xl text-xs font-bold bg-purple-700 hover:bg-purple-800 text-white shadow-xs transition-all flex items-center gap-1.5 cursor-pointer shrink-0"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      <span>Gán lại vào danh sách lớp (Xem trước)</span>
+                    </button>
+                  )}
+                </div>
+
+                {(detailResults?.unmatched || []).length === 0 ? (
+                  <div className="py-10 text-center text-xs text-slate-500 font-medium">
+                    Không có bài nộp nào bị lệch khỏi danh sách lớp. Toàn bộ bài nộp đều khớp 100% theo Mã HS chuẩn!
+                  </div>
+                ) : (
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="bg-purple-50/80 border-b border-purple-200 text-purple-950 font-extrabold uppercase text-[10px] tracking-wider">
+                        <th className="py-2.5 px-2 text-center w-12">STT</th>
+                        <th className="py-2.5 px-3">MÃ HS ĐÃ NỘP</th>
+                        <th className="py-2.5 px-3">TÊN LƯU TRONG BÀI NỘP</th>
+                        <th className="py-2.5 px-3 text-center">ĐIỂM</th>
+                        <th className="py-2.5 px-3 text-center">THỜI GIAN NỘP</th>
+                        <th className="py-2.5 px-3">NGUỒN LƯU</th>
+                        <th className="py-2.5 px-3">LÝ DO CHƯA KHỚP</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {(detailResults?.unmatched || []).map((u, idx) => (
+                        <tr key={`${u.studentCode}-${idx}`} className="hover:bg-purple-50/40">
+                          <td className="py-2.5 px-2 text-center font-bold text-slate-500">{idx + 1}</td>
+                          <td className="py-2.5 px-3 font-extrabold text-purple-800 font-mono">{u.studentCode}</td>
+                          <td className="py-2.5 px-3 font-bold text-slate-800">{u.studentName || '—'}</td>
+                          <td className="py-2.5 px-3 text-center font-black text-indigo-700">
+                            {u.score !== null && u.score !== undefined ? u.score : '—'}
+                          </td>
+                          <td className="py-2.5 px-3 text-center text-slate-600 font-medium">
+                            {u.submittedTime ? formatSubmissionDateTime(u.submittedTime) : '—'}
+                          </td>
+                          <td className="py-2.5 px-3 font-mono text-[11px] text-slate-500">{u.rawSubmission?.__storageSource || 'student_results'}</td>
+                          <td className="py-2.5 px-3 text-rose-700 font-semibold">{u.reason}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+
+                {/* Hộp thoại Xem trước (Dry-run) công cụ Admin "Gán lại" */}
+                {reassignPreview && (
+                  <div className="mt-4 p-4 rounded-2xl bg-purple-50/90 border border-purple-300 space-y-3">
+                    <div className="flex items-center justify-between flex-wrap gap-2">
+                      <div>
+                        <h5 className="text-xs font-extrabold text-purple-950">
+                          📋 Bản xem trước Gán lại bài nộp vào Mã HS hiện tại (Chế độ an toàn - Không xóa bản ghi gốc)
+                        </h5>
+                        <p className="text-[11px] text-purple-800">
+                          Hệ thống chỉ gán tự động các trường hợp chắc chắn 100% ({reassignPreview.canReassign.length} bài). Các trường hợp không chắc chắn ({reassignPreview.uncertain.length} bài) được giữ nguyên để giáo viên tự quyết.
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setReassignPreview(null)}
+                          className="px-3 py-1.5 rounded-lg text-xs font-bold bg-white text-slate-700 border border-slate-300 hover:bg-slate-100 cursor-pointer"
+                        >
+                          Đóng xem trước
+                        </button>
+                        {reassignPreview.canReassign.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={handleExecuteReassignBatch}
+                            disabled={isExecutingReassign}
+                            className="px-3.5 py-1.5 rounded-lg text-xs font-extrabold bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs cursor-pointer disabled:opacity-50"
+                          >
+                            {isExecutingReassign ? 'Đang ghi writeBatch...' : `Xác nhận gán ${reassignPreview.canReassign.length} bài chắc chắn 100%`}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {reassignPreview.canReassign.length > 0 && (
+                      <div className="space-y-1">
+                        <div className="text-[11px] font-extrabold text-emerald-800">
+                          ✓ Khớp chắc chắn 100% ({reassignPreview.canReassign.length}):
+                        </div>
+                        <div className="max-h-40 overflow-y-auto bg-white rounded-xl border border-emerald-200 p-2 text-[11px] space-y-1">
+                          {reassignPreview.canReassign.map((m, i) => (
+                            <div key={i} className="flex items-center justify-between gap-2 py-1 border-b border-slate-100 last:border-0">
+                              <span>
+                                Mã cũ <strong className="font-mono text-rose-700">{m.fromStudentCode}</strong> ({m.fromStudentName}) ➔ Mã chuẩn mới{' '}
+                                <strong className="font-mono text-emerald-700">{m.toStudentCode}</strong> ({m.toStudentName})
+                              </span>
+                              <span className="text-slate-500">{m.matchBasis}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {reassignPreview.uncertain.length > 0 && (
+                      <div className="space-y-1">
+                        <div className="text-[11px] font-extrabold text-amber-800">
+                          ⚠️ Chưa đủ cơ sở 100% — Để lại cho giáo viên kiểm tra ({reassignPreview.uncertain.length}):
+                        </div>
+                        <div className="max-h-40 overflow-y-auto bg-white rounded-xl border border-amber-200 p-2 text-[11px] space-y-1">
+                          {reassignPreview.uncertain.map((u, i) => (
+                            <div key={i} className="flex items-center justify-between gap-2 py-1 border-b border-slate-100 last:border-0">
+                              <span>
+                                Mã <strong className="font-mono text-purple-800">{u.studentCode}</strong> ({u.studentName || 'Không rõ tên'})
+                              </span>
+                              <span className="text-amber-800">{u.reason}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            ) : (
             <div className="flex-1 overflow-x-auto border border-slate-200 rounded-2xl max-h-[52vh] overflow-y-auto bg-white shadow-2xs">
               <table className="w-full text-left border-collapse text-xs">
                 <thead>
@@ -4140,6 +4373,7 @@ export const AssignmentModule: React.FC<AssignmentModuleProps> = ({
                 </tbody>
               </table>
             </div>
+            )}
 
             {/* 4. MODAL FOOTER */}
             <div className="flex items-center justify-end pt-2 border-t border-slate-100">

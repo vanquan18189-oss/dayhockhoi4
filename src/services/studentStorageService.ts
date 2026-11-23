@@ -3,7 +3,7 @@ import { db } from './firebase';
 import { doc, getDoc, setDoc, onSnapshot, collection, query, where, getDocs } from 'firebase/firestore';
 import { trackedSetDoc, trackedDeleteDoc, trackedWriteBatch } from './firestoreWriteTracker';
 import { getScopedDocs } from './firestoreScopeService';
-import { formatStandardStudentCode, normalizeStudentCode } from './studentCode';
+import { formatStandardStudentCode, normalizeStudentCode, isValidStudentCode, parseStudentCode, generateStudentCode } from './studentCode';
 import { propagateStudentCodeChange } from './unmatchedSubmissionsService';
 import { sanitizeForFirestore } from '../utils/firestoreSanitizer';
 
@@ -475,16 +475,52 @@ export function deduplicateAndNormalizeStudents(
     uniqueStudents.push(st);
   });
 
+  // Thu thập tất cả các STT đã tồn tại của học sinh có mã hợp lệ để cấp mã mới theo nguyên tắc: max(existingStt) + 1 (Mã HS bất biến)
+  const existingStts: number[] = [];
+  uniqueStudents.forEach((st) => {
+    const rawStCode = normalizeStudentCode(st.code || (st as any).studentCode || st.username || '');
+    const parsed = parseStudentCode(rawStCode);
+    if (parsed && parsed.stt > 0) {
+      existingStts.push(parsed.stt);
+    }
+  });
+
   const finalSeenIds = new Set<string>();
+  const finalSeenCodes = new Set<string>();
+
   return uniqueStudents.map((st, idx) => {
-    const stt = idx + 1;
-    const rawStCode = st.code || (st as any).studentCode || st.username || '';
-    const code = formatStandardStudentCode(rawStCode, key, stt);
-    
+    const displayStt = idx + 1;
+    const rawStCode = normalizeStudentCode(st.code || (st as any).studentCode || st.username || '');
+    let code = '';
+    let codeStt = displayStt;
+
+    const parsedExisting = parseStudentCode(rawStCode);
+    if (parsedExisting && isValidStudentCode(rawStCode) && !finalSeenCodes.has(rawStCode)) {
+      // Giữ nguyên Mã HS chuẩn bất biến đã cấp cho học sinh
+      code = rawStCode;
+      codeStt = parsedExisting.stt;
+    } else if (rawStCode && !finalSeenCodes.has(formatStandardStudentCode(rawStCode, key))) {
+      const formatted = normalizeStudentCode(formatStandardStudentCode(rawStCode, key));
+      const parsedFormatted = parseStudentCode(formatted);
+      if (parsedFormatted && !finalSeenCodes.has(formatted)) {
+        code = formatted;
+        codeStt = parsedFormatted.stt;
+        existingStts.push(codeStt);
+      }
+    }
+
+    if (!code) {
+      const gen = generateStudentCode(key, st.academicYear || '2026-2027', existingStts);
+      code = gen.code;
+      codeStt = gen.stt;
+      existingStts.push(codeStt);
+    }
+    finalSeenCodes.add(code);
+
     // Ensure every record has a unique ID and no collisions
-    let id = st.id && !finalSeenIds.has(st.id) ? st.id : `st-${key}-${stt}`;
+    let id = st.id && !finalSeenIds.has(st.id) ? st.id : `st-${key.toLowerCase()}-${codeStt}`;
     if (finalSeenIds.has(id)) {
-      id = `st-${key}-${stt}-${idx + 1}`;
+      id = `st-${key.toLowerCase()}-${codeStt}-${displayStt}`;
     }
     finalSeenIds.add(id);
 
@@ -502,7 +538,7 @@ export function deduplicateAndNormalizeStudents(
     return {
       ...st,
       id,
-      stt,
+      stt: displayStt,
       code,
       studentCode: code,
       name: cleanName,
@@ -510,9 +546,9 @@ export function deduplicateAndNormalizeStudents(
       gender: cleanGender,
       dob: st.dob || (st as any).birthday || '10/10/2016',
       sddcn,
-      studentPersistentId: sddcn,
+      studentPersistentId: sddcn || code,
       academicYear: st.academicYear || '2026-2027',
-      username: st.username || code,
+      username: code,
       className: stdName,
       classKey: key,
       grade: 'Khối 4',
